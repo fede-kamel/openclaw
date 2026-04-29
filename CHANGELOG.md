@@ -17,7 +17,7 @@ Docs: https://docs.openclaw.ai
 - Docker setup: add `OPENCLAW_SKIP_ONBOARDING` so automated Docker installs can skip the interactive onboarding step while still applying gateway defaults. (#55518) Thanks @jinjimz.
 - Gateway/memory: add a read-only `doctor.memory.remHarness` RPC so operator clients can preview bounded REM dreaming output without running mutation paths. (#66673) Thanks @samzong.
 - Gateway/events: surface `spawnedBy` on subagent chat and agent broadcast payloads so clients can route child session events without an extra session lookup. (#63244) Thanks @samzong.
-- Security/OpenGrep: add a GHSA detector-review pipeline that compiles per-advisory OpenGrep rules into the precise `security/opengrep/precise.yml` super-config, plus a PR/main CI workflow that scans first-party code and uploads SARIF to GitHub Code Scanning [AI-assisted]. (#69483) Thanks @jesse-merhi.
+- Security/OpenGrep: add a GHSA detector-review pipeline that compiles per-advisory OpenGrep rules into the precise `security/opengrep/precise.yml` super-config, plus a PR-diff CI workflow and a separate manual full-repository scan that upload SARIF to GitHub Code Scanning [AI-assisted]. (#69483) Thanks @jesse-merhi.
 
 ### Fixes
 
