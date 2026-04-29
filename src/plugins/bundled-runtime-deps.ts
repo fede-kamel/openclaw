@@ -38,6 +38,7 @@ export type BundledRuntimeDepsInstallParams = {
 
 export type BundledRuntimeDepsEnsureResult = {
   installedSpecs: string[];
+  retainSpecs: string[];
 };
 
 export type BundledRuntimeDepsInstallRoot = {
@@ -101,6 +102,18 @@ type BundledRuntimeDepsInstallState = {
   arch: string;
   completedAt: string;
 };
+
+function createBundledRuntimeDepsEnsureResult(params: {
+  installedSpecs: string[];
+  retainSpecs?: string[];
+}): BundledRuntimeDepsEnsureResult {
+  const result = { installedSpecs: params.installedSpecs } as BundledRuntimeDepsEnsureResult;
+  Object.defineProperty(result, "retainSpecs", {
+    value: params.retainSpecs ?? [],
+    enumerable: false,
+  });
+  return result;
+}
 
 const BUNDLED_RUNTIME_DEP_SEGMENT_RE = /^[a-z0-9][a-z0-9._-]*$/;
 
@@ -2225,6 +2238,7 @@ export function ensureBundledPluginRuntimeDeps(params: {
   pluginRoot: string;
   env: NodeJS.ProcessEnv;
   config?: OpenClawConfig;
+  retainSpecs?: readonly string[];
   installDeps?: (params: BundledRuntimeDepsInstallParams) => void;
 }): BundledRuntimeDepsEnsureResult {
   if (
@@ -2235,11 +2249,11 @@ export function ensureBundledPluginRuntimeDeps(params: {
       pluginDir: params.pluginRoot,
     })
   ) {
-    return { installedSpecs: [] };
+    return createBundledRuntimeDepsEnsureResult({ installedSpecs: [] });
   }
   const packageJson = readJsonObject(path.join(params.pluginRoot, "package.json"));
   if (!packageJson) {
-    return { installedSpecs: [] };
+    return createBundledRuntimeDepsEnsureResult({ installedSpecs: [] });
   }
   const pluginDeps = Object.entries(collectRuntimeDeps(packageJson))
     .map(([name, rawVersion]) => parseInstallableRuntimeDep(name, rawVersion))
@@ -2272,14 +2286,17 @@ export function ensureBundledPluginRuntimeDeps(params: {
     }
   }
   if (deps.length === 0) {
-    return { installedSpecs: [] };
+    return createBundledRuntimeDepsEnsureResult({ installedSpecs: [] });
   }
   return withBundledRuntimeDepsInstallRootLock(installRoot, () => {
     const requestedInstallSpecs = createBundledRuntimeDepsInstallSpecs({
       deps,
     });
     const installSpecs = usePackageLevelPlan
-      ? mergeMaterializedRuntimeDepSpecs(installRoot, requestedInstallSpecs)
+      ? mergeRuntimeDepSpecsByPackageName([
+          ...(params.retainSpecs ?? []),
+          ...mergeMaterializedRuntimeDepSpecs(installRoot, requestedInstallSpecs),
+        ])
       : requestedInstallSpecs;
     const missingSpecs = deps
       .filter((dep) => !hasDependencySentinel([installRoot], dep))
@@ -2290,10 +2307,10 @@ export function ensureBundledPluginRuntimeDeps(params: {
         installRoot,
         installSpecs,
       });
-      return { installedSpecs: [] };
+      return createBundledRuntimeDepsEnsureResult({ installedSpecs: [] });
     }
     if (isRuntimeDepsPlanAlreadyMaterialized(installRoot, installSpecs)) {
-      return { installedSpecs: [] };
+      return createBundledRuntimeDepsEnsureResult({ installedSpecs: [] });
     }
     const isPluginRootInstall = path.resolve(installRoot) === path.resolve(params.pluginRoot);
     const installExecutionRoot = isPluginRootInstall
@@ -2338,8 +2355,9 @@ export function ensureBundledPluginRuntimeDeps(params: {
       installRoot,
       installSpecs,
     });
-    return {
+    return createBundledRuntimeDepsEnsureResult({
       installedSpecs: missingSpecs.length > 0 ? missingSpecs : installSpecs,
-    };
+      retainSpecs: installSpecs,
+    });
   });
 }
