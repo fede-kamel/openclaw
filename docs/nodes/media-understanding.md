@@ -110,7 +110,7 @@ Each `models[]` entry is a **provider** entry (default) or a **CLI** entry:
     }
     ```
 
-    `args` is how the attachment reaches the command: nothing appends the staged file path for you. A CLI entry with no `args` runs its command bare and cannot produce output, so include at least one attachment placeholder. `openclaw config validate` and `openclaw doctor` warn about a CLI entry that has no `command` or no `args`.
+    `args` is how the attachment reaches the command: nothing appends the staged file path for you. A CLI entry with no `args` runs its command bare, so the attachment is never passed to it; include at least one attachment placeholder.
 
     Placeholders are substituted literally into each argument, and an unset one becomes an **empty argument** rather than being dropped. `{{Language}}` is only populated when a language is resolved from the request, the entry's `language`, or `tools.media.audio.language`; with none set, `["--language", "{{Language}}"]` runs as `--language ""`. Transcribers that reject an empty language should omit the flag and its value together and rely on autodetection. The same rule applies to `{{Prompt}}` and any other optional placeholder.
 
