@@ -19,7 +19,7 @@ describe("media CLI entry config warnings", () => {
       {
         path: "tools.media.models.0.command",
         message:
-          'Media model entry has type "cli" but no command; it fails on the first attachment. Set command, or drop type to use a provider entry.',
+          "Media model entry resolves to a CLI entry but has no usable command; it fails on the first attachment. Set command, or drop type to use a provider entry.",
       },
     ]);
   });
@@ -33,7 +33,19 @@ describe("media CLI entry config warnings", () => {
       {
         path: "tools.media.models.0.args",
         message:
-          'Media CLI entry "/usr/local/bin/oc-transcribe" has no args, so it runs with no attachment path and cannot produce output. Add an attachment placeholder such as {{AttachmentPath}}.',
+          'Media CLI entry "/usr/local/bin/oc-transcribe" has no args, so the attachment path is never passed to it. Add an attachment placeholder such as {{AttachmentPath}}.',
+      },
+    ]);
+  });
+
+  it("warns for an inferred cli entry whose command is only whitespace", () => {
+    // runner.ts infers "cli" from the raw command, so this entry reaches CLI
+    // execution and throws there. Trimming before inferring would hide it.
+    expect(mediaCliWarnings([{ command: "   ", capabilities: ["audio"] }])).toEqual([
+      {
+        path: "tools.media.models.0.command",
+        message:
+          "Media model entry resolves to a CLI entry but has no usable command; it fails on the first attachment. Set command, or drop type to use a provider entry.",
       },
     ]);
   });

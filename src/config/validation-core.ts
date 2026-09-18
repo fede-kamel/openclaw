@@ -70,8 +70,10 @@ export function collectHeartbeatOwnerWarnings(config: OpenClawConfig): ConfigVal
 /**
  * CLI media entries only ever receive the attachment through their own `args`;
  * nothing appends the staged path. A missing command or an empty arg list
- * therefore cannot transcribe/describe anything, and stays silent until the
- * first attachment arrives - which in a channel-less setup may be never.
+ * therefore cannot transcribe/describe anything, and goes unnoticed until the
+ * first attachment arrives - which in a channel-less setup may be never. Even
+ * then the runner records a failed attempt and moves to the next candidate
+ * (runner.ts), so the operator never sees a hard failure.
  */
 export function collectMediaCliEntryWarnings(config: OpenClawConfig): ConfigValidationIssue[] {
   const warnings: ConfigValidationIssue[] = [];
@@ -80,24 +82,26 @@ export function collectMediaCliEntryWarnings(config: OpenClawConfig): ConfigVali
     if (!entry) {
       continue;
     }
-    const command = entry.command?.trim();
-    // Mirrors the runtime entry-type resolution in entry-capabilities.ts.
-    if ((entry.type ?? (command ? "cli" : "provider")) !== "cli") {
+    // Infer from the raw command, exactly as runner.ts does: a whitespace-only
+    // command still selects CLI execution at runtime, which then throws on the
+    // trimmed value. Trimming before inferring would silence that entry here.
+    if ((entry.type ?? (entry.command ? "cli" : "provider")) !== "cli") {
       continue;
     }
+    const command = entry.command?.trim();
     const basePath = `tools.media.models.${index}`;
     if (!command) {
       warnings.push({
         path: `${basePath}.command`,
         message:
-          'Media model entry has type "cli" but no command; it fails on the first attachment. Set command, or drop type to use a provider entry.',
+          "Media model entry resolves to a CLI entry but has no usable command; it fails on the first attachment. Set command, or drop type to use a provider entry.",
       });
       continue;
     }
     if ((entry.args ?? []).length === 0) {
       warnings.push({
         path: `${basePath}.args`,
-        message: `Media CLI entry "${command}" has no args, so it runs with no attachment path and cannot produce output. Add an attachment placeholder such as {{AttachmentPath}}.`,
+        message: `Media CLI entry "${command}" has no args, so the attachment path is never passed to it. Add an attachment placeholder such as {{AttachmentPath}}.`,
       });
     }
   }
