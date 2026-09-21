@@ -13,7 +13,12 @@
 
 ## Better Defaults
 
-- Run provider-secret preflight first. Require real `/models` or equivalent endpoint checks for release-blocking providers.
+- Run provider-secret preflight first. Required providers need a real completion
+  to prove inference entitlement; a successful `/models` request proves only
+  authentication. The current verifier probes inference only for Anthropic;
+  OpenAI and Fireworks remain authentication-only. Record and complete their
+  missing inference proof before expensive dispatch, using the existing live
+  provider lane with the same credential source.
 - Keep one watcher open. Use child summaries every few minutes, not every few seconds.
 - Fetch failed-job logs only after a job reaches a terminal failing state.
 - Prefer same-parent failed-job reruns when the original inputs still select the
@@ -25,6 +30,11 @@
 - Classify one failed surface, make one fix when needed, and retry the narrowest
   failed group once. Then reassess whether to ship, explicitly waive, or block
   instead of creating another verification loop.
+- Release-check recovery uses one concrete group. The removed `release-checks`
+  aggregate handle must never be substituted with `all`.
+- Controller recovery uses `qa-parity` or `qa-live`; `qa` is reserved for a
+  deliberate direct-child manual aggregate. Filters that do not belong to the
+  selected group fail closed.
 - Preserve successful exact-tuple evidence when the documented finalization
   rules allow reuse. Narrow evidence does not become publish authorization by
   itself, and there is no standalone rerunnable finalizer today.

@@ -2,6 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { MediaUnderstandingModelConfig } from "../config/types.tools.js";
+import { resolveEnvironmentValue } from "../infra/process-env.js";
 import { runExec } from "../process/exec.js";
 import { getOrCreatePromise } from "../shared/lazy-promise.js";
 import { optionalPathExists } from "./fs.js";
@@ -79,14 +80,11 @@ const binaryCache = new Map<string, Promise<string | null>>();
 const libraryCache = new Map<string, Promise<string | null>>();
 const observedBackendCache = new Map<string, "cpu" | "cuda" | "metal">();
 
-export function clearLocalAudioInspectionCacheForTests(): void {
-  binaryCache.clear();
-  libraryCache.clear();
-  observedBackendCache.clear();
-}
-
 function commandId(command: string): string {
-  return path.basename(command.trim()).toLowerCase();
+  return path
+    .basename(command.trim())
+    .replace(/\.(?:exe|com|cmd|bat)$/i, "")
+    .toLowerCase();
 }
 
 export function resolveRequestedLocalAudioBackend(params: {
@@ -146,13 +144,6 @@ export function recordLocalAudioBackendObservation(params: {
   return backend;
 }
 
-function getObservedBackend(params: {
-  command: string;
-  args: readonly string[];
-}): "cpu" | "cuda" | "metal" | undefined {
-  return observedBackendCache.get(observationKey(params));
-}
-
 async function isExecutable(filePath: string, platform: NodeJS.Platform): Promise<boolean> {
   try {
     const stat = await fs.stat(filePath);
@@ -168,11 +159,11 @@ async function isExecutable(filePath: string, platform: NodeJS.Platform): Promis
   }
 }
 
-function binaryNames(name: string, platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
+function binaryNames(name: string, platform: NodeJS.Platform, pathExtensions?: string): string[] {
   if (platform !== "win32" || path.extname(name)) {
     return [name];
   }
-  const extensions = (env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM")
+  const extensions = (pathExtensions ?? ".EXE;.CMD;.BAT;.COM")
     .split(";")
     .map((extension) => extension.trim())
     .filter(Boolean);
@@ -196,13 +187,15 @@ async function findBinary(
   platform: NodeJS.Platform,
   checkExecutable: (filePath: string, platform: NodeJS.Platform) => Promise<boolean> = isExecutable,
 ): Promise<string | null> {
-  const key = `${platform}\0${env.PATH ?? ""}\0${env.PATHEXT ?? ""}\0${name}`;
+  const pathValue = resolveEnvironmentValue(env, "PATH", platform) ?? "";
+  const pathExtensions = resolveEnvironmentValue(env, "PATHEXT", platform);
+  const key = `${platform}\0${pathValue}\0${pathExtensions ?? ""}\0${name}`;
   return await getOrCreatePromise(
     binaryCache,
     key,
     async () => {
       const direct = name.trim();
-      const candidates = binaryNames(direct, platform, env);
+      const candidates = binaryNames(direct, platform, pathExtensions);
       if (direct.includes("/") || direct.includes("\\")) {
         for (const candidate of candidates) {
           const expanded =
@@ -215,7 +208,7 @@ async function findBinary(
         }
         return null;
       }
-      for (const directory of (env.PATH ?? "").split(path.delimiter)) {
+      for (const directory of pathValue.split(path.delimiter)) {
         const expandedDirectory = expandHomeDir(directory, env);
         if (!expandedDirectory) {
           continue;
@@ -324,7 +317,7 @@ export async function inspectLocalAudioSelection(
     envModel && (await optionalPathExists(envModel))
       ? envModel
       : await discoverWhisperCppModel(options.listDirectory ?? listDirectoryEntries);
-  const whisperReady = Boolean(whisperCommand) && Boolean(whisperModel);
+  const whisperReady = whisperCommand !== null && Boolean(whisperModel);
   const whisperBackend = whisperCommand
     ? await inspectWhisperBackend({
         command: whisperCommand,
@@ -344,10 +337,10 @@ export async function inspectLocalAudioSelection(
       )
     : [];
   const sherpaReady =
-    Boolean(sherpaCommand) &&
+    sherpaCommand !== null &&
     sherpaFiles.length === 4 &&
     (await Promise.all(sherpaFiles.map(optionalPathExists))).every(Boolean);
-  const parakeetReady = Boolean(parakeetCommand) && platform === "darwin" && arch === "arm64";
+  const parakeetReady = parakeetCommand !== null && platform === "darwin" && arch === "arm64";
   const parakeetArgs = [
     "{{AttachmentPath}}",
     "--output-format",
@@ -386,6 +379,7 @@ export async function inspectLocalAudioSelection(
     "{{AttachmentPath}}",
   ];
 
+  // Execute discovered files; shell-free spawn does not expand home shorthand in PATH.
   const candidates: LocalAudioCandidate[] = [
     {
       id: "parakeet-mlx",
@@ -406,7 +400,7 @@ export async function inspectLocalAudioSelection(
       entry: parakeetReady
         ? {
             type: "cli",
-            command: "parakeet-mlx",
+            command: parakeetCommand,
             args: parakeetArgs,
           }
         : undefined,
@@ -422,7 +416,9 @@ export async function inspectLocalAudioSelection(
         command: "whisper-cli",
         args: whisperArgs,
       }),
-      observedBackend: getObservedBackend({ command: "whisper-cli", args: whisperArgs }),
+      observedBackend: whisperCommand
+        ? observedBackendCache.get(observationKey({ command: whisperCommand, args: whisperArgs }))
+        : undefined,
       selected: false,
       reason: whisperCommand
         ? whisperReady
@@ -432,7 +428,7 @@ export async function inspectLocalAudioSelection(
       entry: whisperReady
         ? {
             type: "cli",
-            command: "whisper-cli",
+            command: whisperCommand,
             args: whisperArgs,
           }
         : undefined,
@@ -454,7 +450,7 @@ export async function inspectLocalAudioSelection(
       entry: sherpaReady
         ? {
             type: "cli",
-            command: "sherpa-onnx-offline",
+            command: sherpaCommand,
             args: sherpaArgs,
           }
         : undefined,
@@ -471,7 +467,7 @@ export async function inspectLocalAudioSelection(
       entry: pythonCommand
         ? {
             type: "cli",
-            command: "whisper",
+            command: pythonCommand,
             args: pythonArgs,
           }
         : undefined,

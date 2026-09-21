@@ -13,6 +13,7 @@ import type { SubagentRunRecord } from "./subagent-registry.types.js";
 // registration, so in-place lifecycle field edits never require re-indexing.
 const collectorRunIdByChildSessionKey = new Map<string, string>();
 const runsByChildSessionKey = new Map<string, Map<string, SubagentRunRecord>>();
+const runsByRequesterSessionKey = new Map<string, Map<string, SubagentRunRecord>>();
 const runsByCollectorGroupKey = new Map<string, Map<string, SubagentRunRecord>>();
 
 function collectorGroupKey(entry: SubagentRunRecord): string | undefined {
@@ -61,11 +62,95 @@ function indexSubagentRun(
   }
 }
 
+type SubagentRetirementScope = {
+  observation:
+    | ({ entry: SubagentRunRecord; state: "selected" | "retired" } & Pick<
+        SubagentRunRecord,
+        "generation" | "createdAt"
+      >)
+    | { entry?: never; generation?: never; createdAt?: never; state: "superseded" };
+  isSuccessor: (candidate: SubagentRunRecord) => boolean;
+};
+
 class SubagentRunMap extends Map<string, SubagentRunRecord> {
+  private readonly retirementScopes = new Set<SubagentRetirementScope>();
+
+  /** A cancellation borrows retirement evidence only for its own lexical lifetime. */
+  captureRetirement(
+    entry: SubagentRunRecord,
+    isSuccessor: (candidate: SubagentRunRecord) => boolean,
+  ) {
+    const scope: SubagentRetirementScope = {
+      observation: {
+        entry,
+        generation: entry.generation,
+        createdAt: entry.createdAt,
+        state: "selected",
+      },
+      isSuccessor,
+    };
+    this.retirementScopes.add(scope);
+    return {
+      get observation() {
+        return scope.observation;
+      },
+      release: () => {
+        scope.observation = { state: "superseded" };
+        this.retirementScopes.delete(scope);
+      },
+    };
+  }
+
+  /** Publish only accepted ownership, after synchronous registration/recovery rollback decisions. */
+  commitOwnership(entry: SubagentRunRecord): void {
+    if (this.get(entry.runId) !== entry) {
+      return;
+    }
+    for (const scope of this.retirementScopes) {
+      const previous = scope.observation.entry;
+      if (
+        previous &&
+        previous !== entry &&
+        previous.childSessionKey === entry.childSessionKey &&
+        scope.isSuccessor(entry)
+      ) {
+        const receipt = previous.execution.restartRecovery;
+        // Follow only the committed receipt handoff. An ordinary displacement closes
+        // this operation permanently, even if its row disappears before Stop resumes.
+        scope.observation =
+          receipt?.phase === "accepted" &&
+          receipt.idempotencyKey === entry.runId &&
+          entry.execution.restartRecovery === receipt
+            ? {
+                entry,
+                generation: entry.generation,
+                createdAt: entry.createdAt,
+                state: "selected",
+              }
+            : { state: "superseded" };
+      }
+    }
+  }
+
+  /** Normal cleanup calls this only after its deletion commits; raw map deletion is not evidence. */
+  confirmRetirement(entry: SubagentRunRecord): void {
+    for (const scope of this.retirementScopes) {
+      const observed = scope.observation;
+      if (
+        observed.entry === entry &&
+        observed.state === "selected" &&
+        this.get(entry.runId) !== entry
+      ) {
+        observed.state = "retired";
+      }
+    }
+  }
+
   override set(runId: string, entry: SubagentRunRecord): this {
     const prev = this.get(runId);
     if (prev) {
       removeIndexedSubagentRun(runsByChildSessionKey, prev.childSessionKey, runId, prev);
+      removeIndexedSubagentRun(runsByRequesterSessionKey, prev.requesterSessionKey, runId, prev);
       removeIndexedSubagentRun(runsByCollectorGroupKey, collectorGroupKey(prev), runId, prev);
       if (prev.collect === true && prev.childSessionKey) {
         collectorRunIdByChildSessionKey.delete(prev.childSessionKey);
@@ -73,6 +158,7 @@ class SubagentRunMap extends Map<string, SubagentRunRecord> {
     }
     super.set(runId, entry);
     indexSubagentRun(runsByChildSessionKey, entry.childSessionKey, runId, entry);
+    indexSubagentRun(runsByRequesterSessionKey, entry.requesterSessionKey, runId, entry);
     indexSubagentRun(runsByCollectorGroupKey, collectorGroupKey(entry), runId, entry);
     if (entry.collect === true && entry.childSessionKey) {
       collectorRunIdByChildSessionKey.set(entry.childSessionKey, runId);
@@ -84,6 +170,7 @@ class SubagentRunMap extends Map<string, SubagentRunRecord> {
     const prev = this.get(runId);
     if (prev) {
       removeIndexedSubagentRun(runsByChildSessionKey, prev.childSessionKey, runId, prev);
+      removeIndexedSubagentRun(runsByRequesterSessionKey, prev.requesterSessionKey, runId, prev);
       removeIndexedSubagentRun(runsByCollectorGroupKey, collectorGroupKey(prev), runId, prev);
     }
     if (
@@ -97,14 +184,19 @@ class SubagentRunMap extends Map<string, SubagentRunRecord> {
   }
 
   override clear(): void {
+    for (const scope of this.retirementScopes) {
+      scope.observation = { state: "superseded" };
+    }
+    this.retirementScopes.clear();
     super.clear();
     collectorRunIdByChildSessionKey.clear();
     runsByChildSessionKey.clear();
+    runsByRequesterSessionKey.clear();
     runsByCollectorGroupKey.clear();
   }
 }
 
-export const subagentRuns: Map<string, SubagentRunRecord> = new SubagentRunMap();
+export const subagentRuns = new SubagentRunMap();
 
 /** Iterate live generations for one child session without scanning the registry. */
 export function getSubagentRunsForChildSession(
@@ -113,13 +205,24 @@ export function getSubagentRunsForChildSession(
   return runsByChildSessionKey.get(childSessionKey)?.values() ?? [];
 }
 
+/** Current requester-owned generations, without restoring or scanning retained rows. */
+export function getSubagentRunsForRequesterSession(
+  requesterSessionKey: string,
+): Iterable<SubagentRunRecord> {
+  return runsByRequesterSessionKey.get(requesterSessionKey)?.values() ?? [];
+}
+
 /** Iterate live collector members for one requester/group archive decision. */
 export function getSubagentRunsForCollectorGroup(
   requesterSessionKey: string,
   groupId: string,
+  requesterAgentId?: string,
 ): Iterable<[string, SubagentRunRecord]> {
   const key = JSON.stringify([requesterSessionKey, groupId]);
-  return runsByCollectorGroupKey.get(key)?.entries() ?? [];
+  // Restore can backfill agent ownership after index insertion; read the live owner.
+  return [...(runsByCollectorGroupKey.get(key)?.entries() ?? [])].filter(
+    ([, entry]) => entry.requesterAgentId === requesterAgentId,
+  );
 }
 
 /** Resolve a collector tombstone that reserves its child session from ordinary turns. */

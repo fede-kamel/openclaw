@@ -6,7 +6,13 @@ import {
 } from "@openclaw/llm-core";
 import { WebSocketError } from "openai/resources/responses/internal-base.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createPluginMetadataSnapshot,
+  makeRegistry,
+} from "../../../../src/config/plugin-auto-enable.test-helpers.js";
 import { isRetryableAssistantError } from "../../../../src/llm/utils/retry.js";
+import { createEmptyPluginRegistry } from "../../../../src/plugins/registry-empty.js";
+import { withPluginRuntimeGenerationScope } from "../../../../src/plugins/runtime/generation-scope.js";
 import { configureAiTransportHost, getAiTransportHost } from "../host.js";
 import { cleanupSessionResources } from "../session-resources.js";
 import {
@@ -14,6 +20,10 @@ import {
   responsesPromptObserver,
   type ResponsesPromptObservation,
 } from "./openai-responses-contracts.js";
+import {
+  withProviderAcceptanceObserver,
+  type ProviderAcceptance,
+} from "./transport-stream-shared.js";
 
 type StreamMessage =
   | { type: "open" }
@@ -266,8 +276,10 @@ async function run(
     sessionId?: string;
     timeoutMs?: number;
     headers?: Record<string, string>;
+    cacheRetention?: "none" | "short";
     observations?: ResponsesPromptObservation[];
     onCompactionRejected?: () => void;
+    acceptanceObserver?: (acceptance: ProviderAcceptance) => void;
   } = {},
 ): Promise<AssistantMessage> {
   const options = {
@@ -277,8 +289,12 @@ async function run(
     reasoningEffort: "low",
     timeoutMs: overrides.timeoutMs,
     headers: overrides.headers,
+    cacheRetention: overrides.cacheRetention,
     onCompactionRejected: overrides.onCompactionRejected,
   };
+  if (overrides.acceptanceObserver) {
+    withProviderAcceptanceObserver(options, overrides.acceptanceObserver);
+  }
   if (overrides.observations) {
     responsesPromptObserver.set(options, (observation) =>
       overrides.observations?.push(observation),
@@ -327,6 +343,7 @@ describe("native OpenAI Responses WebSocket client integration", () => {
               headers: {
                 "x-client-request-id": context.sessionId ?? "",
                 "x-openclaw-session-id": context.sessionId ?? "",
+                "x-provider-route": "route-a",
               },
               degradeCooldownMs: 1_000,
             },
@@ -339,6 +356,77 @@ describe("native OpenAI Responses WebSocket client integration", () => {
   afterEach(() => {
     cleanupSessionResources();
     configureAiTransportHost(initialHost);
+  });
+
+  it.each([undefined, "short", "none"] as const)(
+    "preserves affinity policy and WebSocket acceptance with %s retention",
+    async (cacheRetention) => {
+      transportState.responseBatches.push([message(completedEvent("resp_accepted", "ok"))]);
+      const acceptanceObserver = vi.fn();
+
+      const result = await run(
+        { messages: [userMessage("hello", 1)], tools: [] },
+        {
+          acceptanceObserver,
+          cacheRetention,
+          model:
+            cacheRetention === undefined
+              ? model
+              : { ...model, compat: { sendSessionIdHeader: true } },
+        },
+      );
+
+      expect(result.stopReason).toBe("stop");
+      expect(acceptanceObserver).toHaveBeenCalledWith({ kind: "provider_stream_opened" });
+      expect(transportState.websocketOptions[0]?.headers?.session_id).toBe(
+        cacheRetention === "short" ? "session-1" : undefined,
+      );
+      expect(transportState.websocketOptions[0]?.headers?.["x-client-request-id"]).toBe(
+        "session-1",
+      );
+    },
+  );
+
+  it("preserves nonconflicting turn headers with an explicit OpenCode session", async () => {
+    transportState.responseBatches.push([message(completedEvent("resp_accepted", "ok"))]);
+
+    const result = await run(
+      { messages: [userMessage("hello", 1)], tools: [] },
+      {
+        model: {
+          ...model,
+          headers: { "X-OpenCode-Session": "configured-session" },
+        },
+      },
+    );
+
+    expect(result.stopReason).toBe("stop");
+    expect(transportState.websocketOptions[0]?.headers).toMatchObject({
+      "X-OpenCode-Session": "configured-session",
+      "x-client-request-id": "session-1",
+      "x-openclaw-session-id": "session-1",
+      "x-provider-route": "route-a",
+    });
+  });
+
+  it("closes the WebSocket when acceptance observation fails", async () => {
+    transportState.responseBatches.push([message(completedEvent("resp_rejected", "ignored"))]);
+    const hookError = new Error("acceptance observer failed");
+
+    const result = await run(
+      { messages: [userMessage("hello", 1)], tools: [] },
+      {
+        acceptanceObserver: () => {
+          throw hookError;
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      stopReason: "error",
+      errorMessage: "acceptance observer failed",
+    });
+    expect(transportState.websocketCloseCount).toBe(1);
   });
 
   it("continues past provider-only output metadata with one socket and only new input", async () => {
@@ -489,9 +577,17 @@ describe("native OpenAI Responses WebSocket client integration", () => {
     expect(transportState.sdkRequests).toHaveLength(2);
   });
 
-  it.each(["previous_response_not_found", "websocket_connection_limit_reached"])(
-    "recovers a cached continuation rejected with %s over full-history SSE",
-    async (code) => {
+  it.each<{ code: string; param?: string; message?: string }>([
+    { code: "previous_response_not_found", param: "previous_response_id" },
+    { code: "websocket_connection_limit_reached" },
+    {
+      code: "unsupported_parameter",
+      param: "previous_response_id",
+      message: "Previous response cannot be used for this organization due to Zero Data Retention.",
+    },
+  ])(
+    "recovers a cached continuation rejected with $code over full-history SSE",
+    async ({ code, param, message: rejection }) => {
       transportState.responseBatches.push(
         [message(completedEvent("resp_1", "first answer"))],
         [
@@ -499,8 +595,8 @@ describe("native OpenAI Responses WebSocket client integration", () => {
             type: "error",
             error: wrappedSdkServerError({
               code,
-              message: `safe rejection: ${code}`,
-              param: code === "previous_response_not_found" ? "previous_response_id" : undefined,
+              message: rejection ?? `safe rejection: ${code}`,
+              param,
               status: 400,
             }),
           },
@@ -565,7 +661,7 @@ describe("native OpenAI Responses WebSocket client integration", () => {
     });
     transportState.responseBatches.push([{ type: "error", error: cause }]);
     const response = createOpenAIResponsesWebSocketStream({
-      client: createOpenAIResponsesClient(model, { messages: [], tools: [] }, "test-key"),
+      client: createOpenAIResponsesClient(model, "test-key", {}),
       request: { model: model.id, input: [] },
       mode: "websocket",
     });
@@ -770,8 +866,10 @@ describe("native OpenAI Responses WebSocket client integration", () => {
     );
 
     const terminalFacts = {
+      provider: "openai",
       stopReason: "error",
       errorMessage: "server_error: 503 temporary provider response",
+      errorCode: "server_error",
       responseId: "resp_failed",
       responseModel: "gpt-5.6-luna-2026-08-01",
       usage: {
@@ -787,8 +885,38 @@ describe("native OpenAI Responses WebSocket client integration", () => {
     expect(sse).toMatchObject(terminalFacts);
     expect(websocket.usage.cost.total).toBeCloseTo(0.000401, 10);
     expect(sse.usage.cost.total).toBeCloseTo(0.000401, 10);
-    expect(isRetryableAssistantError(websocket)).toBe(true);
-    expect(isRetryableAssistantError(sse)).toBe(true);
+    const classifyFailoverReason = vi.fn(() => undefined);
+    const pluginRegistry = createEmptyPluginRegistry();
+    pluginRegistry.providers.push({
+      pluginId: "openai",
+      source: "test",
+      provider: { id: "openai", label: "OpenAI fixture", auth: [], classifyFailoverReason },
+    });
+    // Agent runs prepare a provider owner before retry classification. Keep that boundary
+    // here so the transport fixture exercises core retry policy without plugin discovery.
+    withPluginRuntimeGenerationScope(
+      {
+        metadataSnapshot: createPluginMetadataSnapshot({
+          manifestRegistry: makeRegistry([{ id: "openai", channels: [], providers: ["openai"] }]),
+        }),
+        pluginRegistry,
+      },
+      () => {
+        expect(isRetryableAssistantError(websocket)).toBe(true);
+        expect(isRetryableAssistantError(sse)).toBe(true);
+      },
+    );
+    const expectedProviderSignal = {
+      provider: "openai",
+      code: "server_error",
+      errorMessage: terminalFacts.errorMessage,
+      errorType: undefined,
+      status: undefined,
+    };
+    expect(classifyFailoverReason.mock.calls).toEqual([
+      [expectedProviderSignal],
+      [expectedProviderSignal],
+    ]);
 
     const next = await run(
       { messages: [userMessage("next", 3)], tools: [] },

@@ -9,14 +9,16 @@ import {
   rehomeSessionDeliveryReferencesForCanonicalRepairBatch,
   type SessionEntryLifecycleRemoval,
 } from "../config/sessions/session-accessor.js";
-import { writeTranscriptArchive } from "../config/sessions/session-accessor.sqlite-archive.js";
+import { writeTranscriptArchive } from "../config/sessions/session-accessor.sqlite-archive-artifact.js";
 import {
   copySessionNodeArtifactsForRepair,
   deleteSessionMembersForRepair,
 } from "../config/sessions/session-accessor.sqlite-node-artifacts.js";
+import { replaceSessionOwnerInTransaction } from "../config/sessions/session-accessor.sqlite-owner.js";
 import { collectSessionStateIdsForEntry } from "../config/sessions/session-accessor.sqlite-references.js";
 import { resolveSqliteTranscriptArchiveDirectory } from "../config/sessions/session-accessor.sqlite-scope.js";
 import { setCanonicalSqliteSessionMainKey } from "../config/sessions/session-canonical-key.js";
+import { preserveCreationStamp } from "../config/sessions/session-entry-provenance.js";
 import { serializeJsonlLines } from "../config/sessions/transcript-jsonl.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -31,6 +33,7 @@ import {
   type CanonicalSessionCandidate,
   type CanonicalSessionCandidateFact,
 } from "./doctor-session-canonical-candidates.js";
+import { resolveTargetSqliteOptions } from "./doctor-session-sqlite-readers.js";
 
 function createCanonicalRepairRemoval(
   candidate: CanonicalSessionCandidate,
@@ -178,24 +181,38 @@ function selectCanonicalSessionCandidate(
     env: params.env,
     sourceAgentId: first.agentId,
   });
-  const metadataCandidates = candidates.filter((candidate) => !candidate.ownerEvidenceOnly);
+  const rankedCandidates = candidates
+    .toSorted((left, right) =>
+      Buffer.compare(
+        Buffer.from(`${left.sqlitePath}\0${left.sessionKey}`, "utf8"),
+        Buffer.from(`${right.sqlitePath}\0${right.sessionKey}`, "utf8"),
+      ),
+    )
+    .map((candidate) => ({
+      entry: candidate.entry,
+      preferred:
+        candidate.sqlitePath === destination.sqlitePath &&
+        candidate.sessionKey === candidate.canonicalKey,
+      value: candidate,
+    }));
+  const metadataCandidates = rankedCandidates.filter(({ value }) => !value.ownerEvidenceOnly);
   const selected = mergeCanonicalSessionEntryCandidates(
-    (metadataCandidates.length > 0 ? metadataCandidates : candidates)
-      .toSorted((left, right) =>
-        Buffer.compare(
-          Buffer.from(`${left.sqlitePath}\0${left.sessionKey}`, "utf8"),
-          Buffer.from(`${right.sqlitePath}\0${right.sessionKey}`, "utf8"),
-        ),
-      )
-      .map((candidate) => ({
-        entry: candidate.entry,
-        preferred:
-          candidate.sqlitePath === destination.sqlitePath &&
-          candidate.sessionKey === candidate.canonicalKey,
-        value: candidate,
-      })),
+    metadataCandidates.length > 0 ? metadataCandidates : rankedCandidates,
   );
-  return selected ? { ...selected, destination } : undefined;
+  if (!selected) {
+    return undefined;
+  }
+  // Metadata follows recency, but an existing canonical isolation identity wins
+  // even over a newer required alias. Otherwise retain the newest required alias.
+  const requiredCandidates = rankedCandidates.filter(({ entry }) => entry.sandbox === "required");
+  const authoritativeStamp =
+    requiredCandidates.find(({ preferred }) => preferred)?.entry ??
+    mergeCanonicalSessionEntryCandidates(requiredCandidates)?.entry;
+  return {
+    ...selected,
+    entry: preserveCreationStamp(selected.entry, authoritativeStamp),
+    destination,
+  };
 }
 
 type SingleDatabaseCanonicalRepairGroup = {
@@ -257,6 +274,11 @@ function applyCanonicalDestinationArtifacts(params: {
   rehomeDeliveries: boolean;
   winner: CanonicalSessionCandidate;
 }): void {
+  replaceSessionOwnerInTransaction(
+    params.database,
+    params.winner.canonicalKey,
+    params.winner.entry.owner,
+  );
   const destinationAliasKeys = listCanonicalDestinationAliasKeys(
     params.destinationStore,
     params.winner,
@@ -286,6 +308,7 @@ function applyCanonicalDestinationArtifacts(params: {
     params.database,
     [params.winner.sessionKey],
     params.winner.canonicalKey,
+    { includeParticipants: false },
   );
 }
 
@@ -407,7 +430,7 @@ async function repairCanonicalSessionGroup(
     }
   }
   setCanonicalSqliteSessionMainKey(
-    openOpenClawAgentDatabase({ agentId: destination.agentId, path: destination.sqlitePath }),
+    openOpenClawAgentDatabase(resolveTargetSqliteOptions(destination, params.env)),
     params.cfg.session?.mainKey,
   );
   const winnerResult = await applySessionEntryLifecycleMutation({
@@ -490,7 +513,7 @@ export async function repairCanonicalSessionKeys(params: {
   if (params.apply) {
     for (const store of stores) {
       setCanonicalSqliteSessionMainKey(
-        openOpenClawAgentDatabase({ agentId: store.agentId, path: store.sqlitePath }),
+        openOpenClawAgentDatabase(resolveTargetSqliteOptions(store, env)),
         params.cfg.session?.mainKey,
       );
     }

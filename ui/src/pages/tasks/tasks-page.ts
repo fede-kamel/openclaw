@@ -1,14 +1,17 @@
 import { consume } from "@lit/context";
 import { initialState, Task, TaskStatus } from "@lit/task";
-import { html } from "lit";
+import { html, nothing } from "lit";
 import { state } from "lit/decorators.js";
-import type { GatewayBrowserClient } from "../../api/gateway.ts";
-import { titleForRoute } from "../../app-navigation.ts";
+import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
+import { subtitleForRoute, titleForRoute } from "../../app-navigation.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
 import { hasOperatorReadAccess, hasOperatorWriteAccess } from "../../app/operator-access.ts";
 import { renderAgentScopeControl } from "../../components/agent-scope-control.ts";
+import { renderSettingsPageHeader } from "../../components/settings-ui.ts";
+import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
 import { t } from "../../i18n/index.ts";
 import { watchAgentScope } from "../../lib/agents/index.ts";
+import { copyToClipboard } from "../../lib/clipboard.ts";
 import { formatUiError, formatUiExternalText } from "../../lib/format-error.ts";
 import {
   findUiSessionRow,
@@ -28,11 +31,19 @@ import {
   normalizeTasksGetResult,
   normalizeTasksListResult,
   normalizeTasksRecoveryResult,
+  taskTitle,
 } from "../../lib/tasks/data.ts";
 import type { TaskSummary } from "../../lib/tasks/task-summary.ts";
 import { GatewayPageController } from "../../lit/gateway-page-controller.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
+import {
+  observeTaskDetailEvent,
+  resetTaskDetail,
+  type TaskTranscriptHost,
+} from "../chat/components/chat-task-detail-state.ts";
+import { renderTaskTranscript } from "../chat/components/chat-task-detail.ts";
+import "../../styles/chat/sidebar.css";
 import { renderTasks } from "./view.ts";
 
 function taskMatchesAgentScope(task: TaskSummary, agentId: string | null): boolean {
@@ -56,7 +67,19 @@ type TaskRefreshEventBuffer = {
   events: TaskRefreshEvent[];
 };
 
-async function loadActiveTaskPages(params: {
+class TaskListContinuationError extends Error {
+  constructor(readonly reason: unknown) {
+    super("task list continuation failed");
+  }
+}
+
+function isTaskListContinuationRejection(error: unknown): boolean {
+  return error instanceof GatewayRequestError && error.gatewayCode === "INVALID_REQUEST";
+}
+
+const RECENT_TASK_STATUSES = ["completed", "failed", "timed_out", "cancelled"] as const;
+
+async function loadActiveTaskPagesOnce(params: {
   client: GatewayBrowserClient;
   agentId: string | undefined;
   signal: AbortSignal;
@@ -65,16 +88,23 @@ async function loadActiveTaskPages(params: {
   let cursor: string | undefined;
   const seenCursors = new Set<string>();
   while (true) {
-    const payload = await params.client.request(
-      "tasks.list",
-      {
-        status: ["queued", "running"],
-        limit: 500,
-        ...(params.agentId ? { agentId: params.agentId } : {}),
-        ...(cursor !== undefined ? { cursor } : {}),
-      },
-      { signal: params.signal },
-    );
+    let payload: unknown;
+    try {
+      payload = await params.client.request(
+        "tasks.list",
+        {
+          status: ["queued", "running"],
+          limit: 500,
+          ...(params.agentId ? { agentId: params.agentId } : {}),
+          ...(cursor !== undefined ? { cursor } : {}),
+        },
+        { signal: params.signal },
+      );
+    } catch (error) {
+      throw cursor !== undefined && isTaskListContinuationRejection(error)
+        ? new TaskListContinuationError(error)
+        : error;
+    }
     const page = normalizeTasksListResult(payload);
     if (!page) {
       throw new Error(t("tasksPage.invalidResponse"));
@@ -86,10 +116,46 @@ async function loadActiveTaskPages(params: {
     // Cursors are opaque, so revisiting any prior token is the only safe
     // client-side definition of a non-advancing page sequence.
     if (!page.nextCursor || seenCursors.has(page.nextCursor)) {
-      throw new Error(t("tasksPage.invalidResponse"));
+      throw new TaskListContinuationError(new Error(t("tasksPage.invalidResponse")));
     }
     seenCursors.add(page.nextCursor);
     cursor = page.nextCursor;
+  }
+}
+
+async function loadTaskSnapshotOnce(
+  params: Parameters<typeof loadActiveTaskPagesOnce>[0],
+): Promise<{ active: TaskSummary[]; recent: TaskSummary[] }> {
+  const [active, recentPayload] = await Promise.all([
+    loadActiveTaskPagesOnce(params),
+    params.client.request(
+      "tasks.list",
+      {
+        status: RECENT_TASK_STATUSES,
+        sortBy: "endedAt",
+        limit: 200,
+        ...(params.agentId ? { agentId: params.agentId } : {}),
+      },
+      { signal: params.signal },
+    ),
+  ]);
+  const recent = normalizeTasksListResult(recentPayload);
+  if (!recent) {
+    throw new Error(t("tasksPage.invalidResponse"));
+  }
+  return { active, recent: recent.tasks };
+}
+
+async function loadTaskSnapshot(
+  params: Parameters<typeof loadActiveTaskPagesOnce>[0],
+): Promise<{ active: TaskSummary[]; recent: TaskSummary[] }> {
+  try {
+    return await loadTaskSnapshotOnce(params);
+  } catch (error) {
+    if (!(error instanceof TaskListContinuationError)) {
+      throw error;
+    }
+    return await loadTaskSnapshotOnce(params);
   }
 }
 
@@ -99,14 +165,26 @@ class TasksPage extends OpenClawLightDomElement {
 
   @state() private tasks: TaskSummary[] = [];
   @state() private error: string | null = null;
+  @state() private copyResultError: string | null = null;
   @state() private cancellingTaskIds = new Set<string>();
 
+  @state() private transcriptTaskId: string | null = null;
+  private readonly transcriptHost: TaskTranscriptHost = {
+    client: null,
+    connected: false,
+    requestUpdate: () => this.requestUpdate(),
+  };
+
   private taskRefreshEvents: TaskRefreshEventBuffer | null = null;
+  private taskSnapshotInvalidated = false;
+  private copyResultAttempt = 0;
   private readonly gateway = new GatewayPageController(this, {
     getGateway: () => this.context?.gateway,
     onIdentityChange: () => {
       this.tasks = [];
+      this.taskSnapshotInvalidated = false;
       this.error = null;
+      this.copyResultError = null;
     },
     invalidateRequests: () => this.cancelGatewayWork(),
     onSnapshot: () => {
@@ -119,7 +197,7 @@ class TasksPage extends OpenClawLightDomElement {
   private readonly observeAgentScope = watchAgentScope(() => {
     this.gateway.invalidate();
     this.cancelGatewayWork();
-    this.tasks = [];
+    this.invalidateTaskSnapshot();
     if (this.gateway.connected) {
       void this.refreshTasks();
     }
@@ -138,6 +216,13 @@ class TasksPage extends OpenClawLightDomElement {
     ) {
       buffer.events.push(event);
     }
+  }
+
+  private invalidateTaskSnapshot() {
+    this.closeTranscript();
+    this.taskRefreshEvents = null;
+    this.taskSnapshotInvalidated = true;
+    this.tasks = [];
   }
 
   private readonly listTask = new Task(this, {
@@ -161,23 +246,8 @@ class TasksPage extends OpenClawLightDomElement {
       };
       this.taskRefreshEvents = buffer;
       const agentId = scopeId ?? undefined;
-      const [active, recentPayload] = await Promise.all([
-        loadActiveTaskPages({ client, agentId, signal }),
-        client.request(
-          "tasks.list",
-          {
-            status: ["completed", "failed", "timed_out", "cancelled"],
-            limit: 200,
-            ...(agentId ? { agentId } : {}),
-          },
-          { signal },
-        ),
-      ]);
-      const recent = normalizeTasksListResult(recentPayload);
-      if (!recent) {
-        throw new Error(t("tasksPage.invalidResponse"));
-      }
-      return { active, recent: recent.tasks, buffer };
+      const snapshot = await loadTaskSnapshot({ client, agentId, signal });
+      return { ...snapshot, buffer };
     },
     onComplete: ({ active, recent, buffer }) => {
       // The active query is issued first; a same-millisecond recent page
@@ -186,14 +256,23 @@ class TasksPage extends OpenClawLightDomElement {
       for (const event of buffer.events) {
         tasks = applyTaskEvent(tasks, event).tasks;
       }
+      this.taskSnapshotInvalidated = false;
       this.tasks = tasks;
+      this.reconcileTranscriptSelection();
       if (this.taskRefreshEvents === buffer) {
         this.taskRefreshEvents = null;
       }
     },
     onError: (error) => {
-      this.taskRefreshEvents = null;
-      this.error = formatUiError(error, t("tasksPage.loadFailed"));
+      if (error instanceof TaskListContinuationError) {
+        this.invalidateTaskSnapshot();
+      } else {
+        this.taskRefreshEvents = null;
+      }
+      this.error = formatUiError(
+        error instanceof TaskListContinuationError ? error.reason : error,
+        t("tasksPage.loadFailed"),
+      );
     },
   });
   private readonly subscriptions = new SubscriptionsController(this)
@@ -209,11 +288,6 @@ class TasksPage extends OpenClawLightDomElement {
           ) {
             return;
           }
-          const result = applyTaskEvent(this.tasks, event.payload);
-          if (result.refetch) {
-            void this.refreshTasks();
-            return;
-          }
           const scopeId = this.context.agentSelection.state.scopeId;
           const normalizedEvent = normalizeTaskEventPayload(event.payload);
           if (
@@ -223,7 +297,19 @@ class TasksPage extends OpenClawLightDomElement {
           ) {
             this.bufferTaskRefreshEvent(normalizedEvent);
           }
+          if (this.taskSnapshotInvalidated) {
+            return;
+          }
+          const result = applyTaskEvent(this.tasks, event.payload);
+          if (result.refetch) {
+            void this.refreshTasks();
+            return;
+          }
           this.tasks = result.tasks.filter((task) => taskMatchesAgentScope(task, scopeId));
+          this.reconcileTranscriptSelection();
+          if (normalizedEvent) {
+            observeTaskDetailEvent(this.transcriptHost, normalizedEvent);
+          }
         });
         return stopEvents;
       },
@@ -238,13 +324,19 @@ class TasksPage extends OpenClawLightDomElement {
     );
 
   override disconnectedCallback() {
+    this.closeTranscript();
+    this.copyResultAttempt += 1;
+    this.copyResultError = null;
     this.subscriptions.clear();
     super.disconnectedCallback();
   }
 
   private cancelGatewayWork() {
+    this.closeTranscript();
     // Reconnects may reuse the client object; the epoch keeps pre-disconnect
     // cancellation responses from mutating the replacement task snapshot.
+    this.copyResultAttempt += 1;
+    this.copyResultError = null;
     this.taskRefreshEvents = null;
     void this.listTask.run([null, null, null]);
     this.cancellingTaskIds = new Set();
@@ -258,6 +350,7 @@ class TasksPage extends OpenClawLightDomElement {
     }
     const scopeId = this.context.agentSelection.state.scopeId;
     this.error = null;
+    this.copyResultError = null;
     return this.listTask.run([gateway, client, scopeId]);
   }
 
@@ -353,6 +446,7 @@ class TasksPage extends OpenClawLightDomElement {
   }
 
   private async copyTaskResult(taskId: string) {
+    const attempt = ++this.copyResultAttempt;
     const scope = this.gateway.capture();
     const gateway = this.gateway.gateway;
     if (!scope || !gateway || this.context.gateway !== gateway) {
@@ -360,30 +454,82 @@ class TasksPage extends OpenClawLightDomElement {
     }
     try {
       const detail = normalizeTasksGetResult(await scope.client.request("tasks.get", { taskId }));
-      if (!this.gateway.isCurrent(scope)) {
+      if (!this.gateway.isCurrent(scope) || attempt !== this.copyResultAttempt) {
         return;
       }
       const result = detail?.result ?? detail?.progressSummary;
       if (!result) {
-        this.error = t("tasksPage.recoveryFailed");
+        this.copyResultError = t("tasksPage.recoveryFailed");
         return;
       }
-      await navigator.clipboard.writeText(result);
+      const copied = await copyToClipboard(
+        result,
+        () => this.gateway.isCurrent(scope) && attempt === this.copyResultAttempt,
+      );
+      if (this.gateway.isCurrent(scope) && attempt === this.copyResultAttempt) {
+        this.copyResultError = copied ? null : t("common.copyFailed");
+      }
     } catch (error) {
-      if (this.gateway.isCurrent(scope)) {
-        this.error = formatUiError(error, t("tasksPage.recoveryFailed"));
+      if (this.gateway.isCurrent(scope) && attempt === this.copyResultAttempt) {
+        this.copyResultError = formatUiError(error, t("tasksPage.recoveryFailed"));
       }
     }
+  }
+
+  private async viewTranscript(taskId: string) {
+    this.transcriptTaskId = taskId;
+    await this.updateComplete;
+    if (!this.isConnected || this.transcriptTaskId !== taskId) {
+      return;
+    }
+    const transcript = this.querySelector<HTMLElement>(".tasks-transcript");
+    transcript?.focus({ preventScroll: true });
+    transcript?.scrollIntoView({ block: "start", behavior: "instant" });
+  }
+
+  private closeTranscript() {
+    resetTaskDetail(this.transcriptHost);
+    this.transcriptTaskId = null;
+  }
+
+  private reconcileTranscriptSelection() {
+    if (this.transcriptTaskId && !this.tasks.some((task) => task.id === this.transcriptTaskId)) {
+      this.closeTranscript();
+    }
+  }
+
+  private renderTranscript() {
+    const task = this.tasks.find((item) => item.id === this.transcriptTaskId);
+    if (!task) {
+      return nothing;
+    }
+    Object.assign(this.transcriptHost, {
+      client: this.gateway.client,
+      connected: this.gateway.connected,
+      connectionEpoch: this.gateway.epoch,
+    });
+    return html`<section
+      class="tasks-transcript"
+      tabindex="-1"
+      aria-label=${t("tasksPage.transcript")}
+    >
+      <div class="tasks-transcript__header">
+        <h2>${taskTitle(task)}</h2>
+        <button class="btn btn--sm" type="button" @click=${() => this.closeTranscript()}>
+          ${t("common.close")}
+        </button>
+      </div>
+      ${renderTaskTranscript({ host: this.transcriptHost, task })}
+    </section>`;
   }
 
   override render() {
     const fallbackAgentId = resolveSessionNavigationAgentId(this.context);
     return html`
-      <section class="content-header content-header--page">
-        <div>
-          <div class="page-title">${titleForRoute("tasks")}</div>
-        </div>
-        <div class="page-header-actions">
+      ${renderSettingsPageHeader({
+        title: titleForRoute("tasks"),
+        subtitle: subtitleForRoute("tasks"),
+        actions: html`
           ${renderAgentScopeControl({
             agents: this.context.agents.state.agentsList?.agents ?? [],
             selection: this.context.agentSelection,
@@ -394,45 +540,51 @@ class TasksPage extends OpenClawLightDomElement {
             ?disabled=${!this.gateway.connected || this.listTask.status === TaskStatus.PENDING}
             @click=${() => void this.refreshTasks()}
           >
-            ${this.listTask.status === TaskStatus.PENDING
-              ? t("common.refreshing")
-              : t("common.refresh")}
+            ${
+              this.listTask.status === TaskStatus.PENDING
+                ? t("common.refreshing")
+                : t("common.refresh")
+            }
           </button>
-        </div>
-      </section>
-      ${renderTasks({
-        basePath: this.context.basePath,
-        agentId: fallbackAgentId,
-        mainKey: resolveUiConfiguredMainKey({
-          agentsList: this.context.agents.state.agentsList,
-          hello: this.context.gateway.snapshot.hello,
-        }),
-        connected: this.gateway.connected,
-        canCopy: hasOperatorReadAccess(this.context.gateway.snapshot.hello?.auth ?? null),
-        // Task mutations need operator.write; read-only operators get no mutation buttons.
-        canCancel: hasOperatorWriteAccess(this.context.gateway.snapshot.hello?.auth ?? null),
-        loading: this.listTask.status === TaskStatus.PENDING,
-        error: this.error,
-        tasks: this.tasks,
-        cancellingTaskIds: this.cancellingTaskIds,
-        sessionRow: (sessionKey) => findUiSessionRow(this.context, sessionKey),
-        onCancel: (taskId) => void this.cancelTask(taskId),
-        onRetry: (taskId) => void this.recoverTask(taskId, "retry"),
-        onDismiss: (taskId) => void this.recoverTask(taskId, "dismiss"),
-        onCopyResult: (taskId) => void this.copyTaskResult(taskId),
-        onNavigateToChat: (sessionKey) => {
-          const face = resolveSessionPreferredFaceForKey(this.context, sessionKey);
-          this.context.navigate(
-            face,
-            sessionNavigationTarget({
-              context: this.context,
-              face,
-              sessionKey,
-              preferenceDerivedFace: true,
-            }).options,
-          );
-        },
+        `,
       })}
+      ${renderSettingsWorkspace(
+        html`${this.renderTranscript()}${renderTasks({
+          basePath: this.context.basePath,
+          agentId: fallbackAgentId,
+          mainKey: resolveUiConfiguredMainKey({
+            agentsList: this.context.agents.state.agentsList,
+            hello: this.context.gateway.snapshot.hello,
+          }),
+          connected: this.gateway.connected,
+          canCopy: hasOperatorReadAccess(this.context.gateway.snapshot.hello?.auth ?? null),
+          // Task mutations need operator.write; read-only operators get no mutation buttons.
+          canCancel: hasOperatorWriteAccess(this.context.gateway.snapshot.hello?.auth ?? null),
+          loading: this.listTask.status === TaskStatus.PENDING,
+          error: this.error,
+          copyResultError: this.copyResultError,
+          tasks: this.tasks,
+          cancellingTaskIds: this.cancellingTaskIds,
+          sessionRow: (sessionKey) => findUiSessionRow(this.context, sessionKey),
+          onCancel: (taskId) => void this.cancelTask(taskId),
+          onRetry: (taskId) => void this.recoverTask(taskId, "retry"),
+          onDismiss: (taskId) => void this.recoverTask(taskId, "dismiss"),
+          onCopyResult: (taskId) => void this.copyTaskResult(taskId),
+          onViewTranscript: (taskId) => void this.viewTranscript(taskId),
+          onNavigateToChat: (sessionKey) => {
+            const face = resolveSessionPreferredFaceForKey(this.context, sessionKey);
+            this.context.navigate(
+              face,
+              sessionNavigationTarget({
+                context: this.context,
+                face,
+                sessionKey,
+                preferenceDerivedFace: true,
+              }).options,
+            );
+          },
+        })}`,
+      )}
     `;
   }
 }

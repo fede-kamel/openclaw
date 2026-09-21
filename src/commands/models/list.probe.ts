@@ -45,16 +45,22 @@ import {
   resolveUsableCustomProviderApiKey,
 } from "../../agents/model-auth.js";
 import { findNormalizedProviderValue, normalizeProviderId } from "../../agents/model-selection.js";
-import { loadPreparedModelCatalog } from "../../agents/prepared-model-catalog.js";
+import { readPreparedModelCatalog } from "../../agents/prepared-model-catalog.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import { resolveDefaultAgentWorkspaceDir } from "../../agents/workspace.js";
 import { formatCliCommand } from "../../cli/command-format.js";
+import { resolveMergedModelProviderEntry } from "../../config/model-provider-config.js";
+import {
+  copyConfigResolutionFacts,
+  copyConfigResolutionFactsExcept,
+  resolveConfigSecretRef,
+} from "../../config/resolution-facts.js";
 import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
-  coerceSecretRef,
   hasConfiguredSecretInput,
   normalizeSecretInputString,
+  resolveSecretInputRef,
 } from "../../config/types.secrets.js";
 import type {
   EmbeddedStateLockHandle,
@@ -62,9 +68,11 @@ import type {
 } from "../../infra/embedded-state-lock.js";
 import type { GatewayLockIdentity, GatewayLockOptions } from "../../infra/gateway-lock.js";
 import { type SecretRefResolveCache, resolveSecretRefString } from "../../secrets/resolve.js";
+import { appendConfigPathSegment } from "../../shared/dot-path.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { disposeOpenClawAgentDatabaseByPath } from "../../state/openclaw-agent-db.js";
 import { redactStatusSecrets } from "../status-all/format.js";
+import { createAuthProbeWork } from "./list.probe.cleanup.js";
 import { buildProbeCandidateMap, selectProbeModel } from "./list.probe.models.js";
 import { formatMs } from "./shared.js";
 
@@ -232,16 +240,11 @@ function formatMissingCredentialProbeError(reasonCode: AuthProbeReasonCode): str
 function resolveProbeSecretRef(profile: ProfileEntry, cfg: OpenClawConfig) {
   const defaults = cfg.secrets?.defaults;
   if (profile.type === "api_key") {
-    if (normalizeSecretInputString(profile.key) !== undefined) {
-      return null;
-    }
-    return coerceSecretRef(profile.keyRef, defaults);
+    return resolveSecretInputRef({ value: profile.key, refValue: profile.keyRef, defaults }).ref;
   }
   if (profile.type === "token") {
-    if (normalizeSecretInputString(profile.token) !== undefined) {
-      return null;
-    }
-    return coerceSecretRef(profile.tokenRef, defaults);
+    return resolveSecretInputRef({ value: profile.token, refValue: profile.tokenRef, defaults })
+      .ref;
   }
   return null;
 }
@@ -258,14 +261,14 @@ function withDirectCredential(
   mode: string | undefined,
 ): OpenClawConfig {
   const providers = cfg.models?.providers ?? {};
-  const configKey =
-    Object.keys(providers).find((key) => normalizeProviderId(key) === provider) ?? provider;
-  const configured = providers[configKey];
+  const configuredEntry = resolveMergedModelProviderEntry(cfg, provider);
+  const configKey = configuredEntry?.providerKey ?? provider;
+  const configured = configuredEntry?.providerConfig;
   if (!configured) {
     return withoutProfileFallback(cfg, provider);
   }
   const auth = mode === "oauth" || mode === "token" ? mode : "api-key";
-  return {
+  const next: OpenClawConfig = {
     ...cfg,
     models: {
       ...cfg.models,
@@ -286,10 +289,14 @@ function withDirectCredential(
       },
     },
   };
+  copyConfigResolutionFactsExcept(cfg, next, [
+    `${appendConfigPathSegment("models.providers", configKey)}.apiKey`,
+  ]);
+  return next;
 }
 
 function withoutProfileFallback(cfg: OpenClawConfig, provider: string): OpenClawConfig {
-  return {
+  const next: OpenClawConfig = {
     ...cfg,
     auth: {
       ...cfg.auth,
@@ -299,20 +306,24 @@ function withoutProfileFallback(cfg: OpenClawConfig, provider: string): OpenClaw
       },
     },
   };
+  copyConfigResolutionFacts(cfg, next);
+  return next;
 }
 
 async function resolveConfiguredProbeCredential(params: {
   cfg: OpenClawConfig;
   input: unknown;
+  path: string;
   cache: SecretRefResolveCache;
 }): Promise<string | null> {
-  const literal = normalizeSecretInputString(params.input);
-  if (literal !== undefined) {
-    return literal;
-  }
-  const ref = coerceSecretRef(params.input, params.cfg.secrets?.defaults);
+  const ref = resolveConfigSecretRef({
+    config: params.cfg,
+    path: params.path,
+    value: params.input,
+    defaults: params.cfg.secrets?.defaults,
+  });
   if (!ref) {
-    return null;
+    return normalizeSecretInputString(params.input) ?? null;
   }
   try {
     return await resolveSecretRefString(ref, {
@@ -378,15 +389,12 @@ export async function buildProbeTargets(params: {
   const providerFilterKey = providerFilter ? normalizeProviderId(providerFilter) : null;
   const profileFilter = new Set(normalizeUniqueStringEntries(options.profileIds));
   const refResolveCache: SecretRefResolveCache = {};
-  const catalog = await loadPreparedModelCatalog({
+  const catalog = await readPreparedModelCatalog({
     config: cfg,
     ...(params.agentId ? { agentId: params.agentId } : {}),
     ...(agentDir ? { agentDir } : {}),
     ...(workspaceDir ? { workspaceDir } : {}),
-    // A provider probe only needs candidate selection. Keep it request-scoped so it cannot
-    // supersede or be superseded by the Gateway's concurrent full-catalog materialization.
     readOnly: true,
-    providerDiscoveryProviderIds: providers,
   });
   const candidates = buildProbeCandidateMap(modelCandidates);
   const targets: AuthProbeTarget[] = [];
@@ -404,7 +412,17 @@ export async function buildProbeTargets(params: {
       candidates,
       catalog,
     });
-    const configuredProvider = findNormalizedProviderValue(cfg.models?.providers, providerKey);
+    const configuredProviderEntry = resolveMergedModelProviderEntry(cfg, providerKey);
+    const configuredProvider = configuredProviderEntry?.providerConfig;
+    const hasConfiguredProviderSecretRef = Boolean(
+      configuredProviderEntry &&
+      resolveConfigSecretRef({
+        config: cfg,
+        path: `${appendConfigPathSegment("models.providers", configuredProviderEntry.providerKey)}.apiKey`,
+        value: configuredProvider?.apiKey,
+        defaults: cfg.secrets?.defaults,
+      }),
+    );
     const includeDirectKeys = options.includeDirectKeys === true && profileFilter.size === 0;
     const includeConfigKey =
       includeDirectKeys &&
@@ -435,6 +453,7 @@ export async function buildProbeTargets(params: {
           })
         : null;
     const configuredValue =
+      configuredProviderEntry &&
       includeConfigKey &&
       configuredReference.kind !== "profile" &&
       configuredReference.kind !== "profile-incompatible"
@@ -447,6 +466,7 @@ export async function buildProbeTargets(params: {
           : await resolveConfiguredProbeCredential({
               cfg,
               input: configuredProvider?.apiKey,
+              path: `${appendConfigPathSegment("models.providers", configuredProviderEntry.providerKey)}.apiKey`,
               cache: refResolveCache,
             })
         : null;
@@ -454,12 +474,13 @@ export async function buildProbeTargets(params: {
       configuredProvider?.auth === "oauth" || configuredProvider?.auth === "token"
         ? configuredProvider.auth
         : "api_key";
-    const resolvedEnvironmentValue = includeDirectKeys
-      ? resolveEnvApiKey(authProviderKey, process.env, {
-          config: cfg,
-          workspaceDir,
-        })
-      : null;
+    const resolvedEnvironmentValue =
+      includeDirectKeys && !hasConfiguredProviderSecretRef
+        ? resolveEnvApiKey(authProviderKey, process.env, {
+            config: cfg,
+            workspaceDir,
+          })
+        : null;
     const environmentValue =
       resolvedEnvironmentValue?.apiKey === configuredValue ? null : resolvedEnvironmentValue;
     const configuredTargetLabel =
@@ -714,12 +735,13 @@ export async function buildProbeTargets(params: {
       continue;
     }
 
-    const envKey = orderResolution.hasExplicitOrder
-      ? null
-      : resolveEnvApiKey(authProviderKey, process.env, {
-          config: cfg,
-          workspaceDir,
-        });
+    const envKey =
+      orderResolution.hasExplicitOrder || hasConfiguredProviderSecretRef
+        ? null
+        : resolveEnvApiKey(authProviderKey, process.env, {
+            config: cfg,
+            workspaceDir,
+          });
     if (!envKey && !hasUsableModelsJsonKey && !hasSyntheticLocalAuth) {
       continue;
     }
@@ -799,6 +821,7 @@ async function probeTarget(params: {
   let sessionTarget: Awaited<ReturnType<typeof prepareInternalSessionEffectsSession>> | undefined;
   let preparedRunAdmission: ReturnType<typeof prepareSystemAgentRunAdmission> | undefined;
 
+  const work = await createAuthProbeWork(params.abortSignal);
   const start = Date.now();
   const buildResult = (status: AuthProbeResult["status"], error?: string): AuthProbeResult => ({
     provider: target.provider,
@@ -859,44 +882,48 @@ async function probeTarget(params: {
       }
     }
     const { runEmbeddedAgent } = await loadEmbeddedRunnerModule();
+    const probeSessionTarget = sessionTarget;
     preparedRunAdmission = prepareSystemAgentRunAdmission(
       probeConfig,
       runId,
       agentId,
       "models.auth-probe",
     );
-    const runResult = (await runEmbeddedAgent({
-      preparedRunAdmission,
-      sessionId: sessionTarget.sessionId,
-      sessionKey: sessionTarget.sessionKey,
-      sessionTarget,
-      agentId,
-      workspaceDir,
-      agentDir: isolatedAgentDir ?? agentDir,
-      config: probeConfig,
-      prompt: PROBE_PROMPT,
-      provider: target.model.provider,
-      model: target.model.model,
-      modelFallbacksOverride: [],
-      authProfileId: isolatedProfileId ?? target.profileId,
-      authProfileIdSource: isolatedProfileId || target.profileId ? "user" : undefined,
-      timeoutMs,
-      runId,
-      lane: `auth-probe:${target.provider}:${target.profileId ?? target.source}`,
-      thinkLevel: "off",
-      reasoningLevel: "off",
-      verboseLevel: "off",
-      streamParams: { maxTokens },
-      agentHarnessRuntimeOverride: "openclaw",
-      disableTools: true,
-      modelRun: true,
-      cleanupBundleMcpOnRunEnd: true,
-      // Keep the isolated generation outside configured Gateway ownership: a
-      // run-provenance lease rebinds the pinned agentDir to the committed
-      // configured owner, losing the synthetic probe profile below.
-      ...(isolatedAgentDir ? { preparedModelRuntimeMode: "isolated-read-only" as const } : {}),
-      abortSignal: params.abortSignal,
-    })) as AgentRunResultView;
+    const runResult = (await work.run(() =>
+      runEmbeddedAgent({
+        preparedRunAdmission,
+        sessionId: probeSessionTarget.sessionId,
+        sessionKey: probeSessionTarget.sessionKey,
+        sessionTarget: probeSessionTarget,
+        agentId,
+        workspaceDir,
+        agentDir: isolatedAgentDir ?? agentDir,
+        config: probeConfig,
+        prompt: PROBE_PROMPT,
+        provider: model.provider,
+        model: model.model,
+        requestedRouteResolution: "resolved",
+        modelFallbacksOverride: [],
+        authProfileId: isolatedProfileId ?? target.profileId,
+        authProfileIdSource: isolatedProfileId || target.profileId ? "user" : undefined,
+        timeoutMs,
+        runId,
+        lane: `auth-probe:${target.provider}:${target.profileId ?? target.source}`,
+        thinkLevel: "off",
+        reasoningLevel: "off",
+        verboseLevel: "off",
+        streamParams: { maxTokens },
+        agentHarnessRuntimeOverride: "openclaw",
+        disableTools: true,
+        modelRun: true,
+        cleanupBundleMcpOnRunEnd: true,
+        // Keep the isolated generation outside configured Gateway ownership: a
+        // run-provenance lease rebinds the pinned agentDir to the committed
+        // configured owner, losing the synthetic probe profile below.
+        ...(isolatedAgentDir ? { preparedModelRuntimeMode: "isolated-read-only" as const } : {}),
+        abortSignal: params.abortSignal,
+      }),
+    )) as AgentRunResultView;
     const terminalError = extractAgentRunTerminalError(runResult);
     if (terminalError) {
       const described = describeFailoverError(new Error(terminalError));
@@ -917,12 +944,39 @@ async function probeTarget(params: {
     );
   } finally {
     preparedRunAdmission?.close();
-    await removeInternalSessionEffectsSession(sessionTarget);
-    if (isolatedAgentDir) {
-      clearRuntimeAuthProfileStoreSnapshot(isolatedAgentDir);
-      disposeOpenClawAgentDatabaseByPath(resolveAuthProfileDatabasePath(isolatedAgentDir));
-      await fs.rm(isolatedAgentDir, { recursive: true, force: true });
-    }
+    await work.settle(async () => {
+      const cleanups: Array<() => void | Promise<void>> = [
+        () => removeInternalSessionEffectsSession(sessionTarget),
+      ];
+      if (isolatedAgentDir) {
+        const ownedDir = isolatedAgentDir;
+        cleanups.push(
+          () => {
+            clearRuntimeAuthProfileStoreSnapshot(ownedDir);
+          },
+          () => {
+            disposeOpenClawAgentDatabaseByPath(resolveAuthProfileDatabasePath(ownedDir));
+          },
+          () => fs.rm(ownedDir, { recursive: true, force: true }),
+        );
+      }
+      const errors: unknown[] = [];
+      for (const cleanup of cleanups) {
+        try {
+          await cleanup();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length === 1) {
+        throw errors[0];
+      }
+      if (errors.length > 1) {
+        throw new AggregateError(errors, "Auth probe resources could not all be released", {
+          cause: errors[0],
+        });
+      }
+    });
   }
 }
 
@@ -1005,16 +1059,28 @@ export async function withAuthProbeStateOwnership<T>(
     await import("../../infra/embedded-state-lock.js");
   const signalBridge = createEmbeddedStateSignalBridge(ownership.process ?? process);
   let stateLock: EmbeddedStateLockHandle | null | undefined;
+  let work: Awaited<ReturnType<typeof createAuthProbeWork>> | undefined;
   try {
+    work = await createAuthProbeWork(signalBridge.signal);
     stateLock = await acquireEmbeddedStateLock({
       options: ownership.gatewayLockOptions,
       signal: signalBridge.signal,
       formatActiveGatewayRefusal: formatActiveGatewayModelsProbeRefusal,
     });
-    return await run(signalBridge.signal);
+    return await work.run(() => run(signalBridge.signal));
   } finally {
-    await stateLock?.release();
-    signalBridge.dispose();
+    const release = async () => {
+      try {
+        await stateLock?.release();
+      } finally {
+        signalBridge.dispose();
+      }
+    };
+    if (work) {
+      await work.settle(release);
+    } else {
+      await release();
+    }
   }
 }
 

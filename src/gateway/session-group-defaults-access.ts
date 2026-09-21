@@ -1,11 +1,7 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { GatewayClient } from "./server-methods/types.js";
-import { resolveSessionGroupMutationTargetsByName } from "./session-group-mutation-targets.js";
-import {
-  authorizeSessionSharingTarget,
-  isGatewayAdmin,
-  resolveSessionSharingTarget,
-} from "./session-sharing.js";
+import { resolveSessionGroupMutationTargetsByName } from "./session-groups.js";
+import { authorizeSessionSharing, isGatewayAdmin } from "./session-sharing.js";
 import type {
   GatewaySessionStoreCache,
   GatewaySessionStoreDiscoveryCache,
@@ -17,6 +13,9 @@ export function filterMutableSessionGroupRecords<T extends { name: string }>(par
   client: GatewayClient | null;
   records: readonly T[];
 }): T[] {
+  if (params.records.length === 0) {
+    return [];
+  }
   const allowed = new Set(params.records.map((record) => record.name));
   if (isGatewayAdmin(params.client)) {
     return [...params.records];
@@ -28,14 +27,15 @@ export function filterMutableSessionGroupRecords<T extends { name: string }>(par
       continue;
     }
     for (const targetRef of targetRefs) {
-      const target = resolveSessionSharingTarget({
-        cfg: params.cfg,
-        sessionKey: targetRef.sessionKey,
-        agentId: targetRef.agentId,
-        storeCache,
-        targetDiscoveryCache,
-      });
-      if (target && authorizeSessionSharingTarget({ client: params.client, target })) {
+      if (
+        authorizeSessionSharing({
+          cfg: params.cfg,
+          client: params.client,
+          ...targetRef,
+          storeCache,
+          targetDiscoveryCache,
+        })
+      ) {
         allowed.delete(name);
         break;
       }

@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 import { createCanonicalFixtureSkill } from "../test-support/test-helpers.js";
 import {
   formatSkillsForPromptCore,
-  resolveSkillDisplayName,
   type Skill,
   formatSkillsCompactForPrompt as formatSkillsCompact,
 } from "./skill-contract.js";
@@ -19,30 +18,15 @@ function makeSkill(name: string, desc = "A skill", filePath = `/skills/${name}/S
   });
 }
 
-describe("resolveSkillDisplayName", () => {
-  it("uses the first Markdown H1 after frontmatter", () => {
-    expect(
-      resolveSkillDisplayName(
-        `---\nname: auto-review\ndescription: Review code.\n---\n# Auto Review\n`,
-        "auto-review",
-      ),
-    ).toBe("Auto Review");
-  });
-
-  it("humanizes the identifier when the skill has no H1", () => {
-    expect(resolveSkillDisplayName("Skill body without a title.\n", "patrick-daily_brief")).toBe(
-      "Patrick Daily Brief",
-    );
-  });
-});
-
 describe("formatSkillsCompact", () => {
   it("keeps the full-format XML output aligned with the upstream formatter for visible skills", () => {
     const skills = [
       makeSkill("notes", "Summarize notes", "/tmp/notes/SKILL.md"),
       { ...makeSkill("weather", "Get weather <data> & forecasts"), promptVersion: "sha256:abc123" },
     ];
-    expect(formatSkillsForPromptCore(skills)).toBe(upstreamFormatSkillsForPrompt(skills));
+    const out = formatSkillsForPromptCore(skills);
+    expect(out).toBe(upstreamFormatSkillsForPrompt(skills));
+    expect(out).not.toContain("<version>");
   });
 
   it("renders all passed skills in the full formatter without reapplying visibility policy", () => {
@@ -56,14 +40,16 @@ describe("formatSkillsCompact", () => {
     expect(formatSkillsCompact([])).toBe("");
   });
 
-  it("keeps compact descriptions with name, location, and version", () => {
-    const out = formatSkillsCompact([
-      { ...makeSkill("weather", "Get weather data"), promptVersion: "sha256:abc123" },
-    ]);
+  it("keeps compact descriptions with name and location", () => {
+    const skill = {
+      ...makeSkill("weather", "Get weather data"),
+      promptVersion: "sha256:abc123",
+    };
+    const out = formatSkillsCompact([skill]);
     expect(out).toContain("<name>weather</name>");
     expect(out).toContain("<description>Get weather data</description>");
     expect(out).toContain("<location>/skills/weather/SKILL.md</location>");
-    expect(out).toContain("<version>sha256:abc123</version>");
+    expect(out).not.toContain("<version>");
   });
 
   it("omits descriptions when their compact budget is zero", () => {

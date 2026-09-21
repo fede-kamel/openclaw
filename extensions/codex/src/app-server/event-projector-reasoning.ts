@@ -103,8 +103,7 @@ export class CodexReasoningProjection {
       .filter((part): part is string => Boolean(part))
       .join("\n");
     if (planText) {
-      // Structured turn updates are the canonical latest plan. Retain the last
-      // non-empty update so the terminal transcript proves planning occurred.
+      // Structured turn updates are the canonical latest plan for terminal classification.
       this.turnPlanText = planText;
     }
     if (source === "codex-app-server" && plan) {
@@ -116,6 +115,7 @@ export class CodexReasoningProjection {
     this.emitPlanUpdate(
       {
         explanation,
+        ...(params.explanationFormat === "plain" ? { explanationFormat: "plain" as const } : {}),
         steps: plan,
       },
       source,
@@ -154,7 +154,7 @@ export class CodexReasoningProjection {
   }
 
   private emitPlanUpdate(
-    params: { explanation?: string | null; steps?: AgentPlanStep[] },
+    params: { explanation?: string | null; explanationFormat?: "plain"; steps?: AgentPlanStep[] },
     source: PlanUpdateSource = "codex-app-server",
   ): void {
     if (!params.explanation && params.steps === undefined) {
@@ -167,6 +167,7 @@ export class CodexReasoningProjection {
         title: "Plan updated",
         source,
         ...(params.explanation ? { explanation: params.explanation } : {}),
+        ...(params.explanationFormat ? { explanationFormat: params.explanationFormat } : {}),
         ...(params.steps ? { steps: params.steps } : {}),
       },
     });

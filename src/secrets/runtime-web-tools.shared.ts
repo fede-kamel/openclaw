@@ -260,6 +260,7 @@ export async function resolveRuntimeWebProviderSurface<
       origin: "bundled",
       config: params.sourceConfig,
       env: { ...process.env, ...params.context.env },
+      manifestRecords: params.context.manifestRegistry?.plugins,
     });
   }
   let allProviders = params.sortProviders(
@@ -287,6 +288,7 @@ export async function resolveRuntimeWebProviderSurface<
       origin: "bundled",
       config: params.sourceConfig,
       env: { ...process.env, ...params.context.env },
+      manifestRecords: params.context.manifestRegistry?.plugins,
     });
     allProviders = params.sortProviders(
       await params.resolveProviders({
@@ -503,26 +505,7 @@ export async function resolveRuntimeWebProviderSelection<
         continue;
       }
 
-      if (params.configuredProvider) {
-        selectedProvider = provider.id;
-        selectedPath = selectedCandidatePath;
-        selectedResolution = selectedCandidateResolution;
-        if (selectedCandidateResolution.value) {
-          setResolvedCredentialPath({
-            resolvedConfig: params.resolvedConfig,
-            path: selectedCandidatePath,
-            value: selectedCandidateResolution.value,
-          });
-          params.setResolvedCredential({
-            resolvedConfig: params.resolvedConfig,
-            provider,
-            value: selectedCandidateResolution.value,
-          });
-        }
-        break;
-      }
-
-      if (isKeyless) {
+      if (params.configuredProvider || isKeyless) {
         selectedProvider = provider.id;
         selectedPath = selectedCandidatePath;
         selectedResolution = selectedCandidateResolution;

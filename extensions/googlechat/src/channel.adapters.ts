@@ -4,6 +4,7 @@ import type {
   ChannelThreadingContext,
   ChannelThreadingToolContext,
 } from "openclaw/plugin-sdk/channel-contract";
+import { identityEntryAuthenticationClassifier } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import {
   createMessageReceiptFromOutboundResults,
   defineChannelMessageAdapter,
@@ -39,6 +40,7 @@ import {
   sanitizeGoogleChatText,
 } from "./format.js";
 import { resolveGoogleChatGroupRequireMention } from "./group-policy.js";
+import { googleChatIngressIdentity } from "./ingress-identity.js";
 
 const loadGoogleChatChannelRuntime = createLazyRuntimeNamedExport(
   () => import("./channel.runtime.js"),
@@ -82,7 +84,7 @@ const collectGoogleChatGroupPolicyWarnings =
 const collectGoogleChatOpenGroupFindings = createConditionalWarningCollector.findings({
   collectWarnings: collectGoogleChatGroupPolicyWarnings,
   checkId: "channels.googlechat.groups.open",
-  severity: "critical",
+  severity: "warn",
   title: "Google Chat security warning",
 });
 
@@ -124,6 +126,7 @@ export const googlechatSecurityAdapter = {
     resolvePolicy: (account: ResolvedGoogleChatAccount) => account.config.dmPolicy,
     resolveAllowFrom: (account: ResolvedGoogleChatAccount) => account.config.allowFrom,
     allowFromPathSuffix: "",
+    classifyEntryAuthentication: identityEntryAuthenticationClassifier(googleChatIngressIdentity),
     normalizeEntry: (raw: string) => formatGoogleChatAllowFromEntry(raw),
   },
   collectWarnings: collectGoogleChatSecurityWarnings,

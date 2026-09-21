@@ -6,9 +6,8 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
-import { listAgentIds } from "../agents/agent-scope-config.js";
+import { listAgentIds, tryResolveAgentOperationAgentId } from "../agents/agent-scope-config.js";
 import { listChannelPlugins } from "../channels/plugins/index.js";
-import { tryResolveLegacyCompatibilityAgentId } from "../config/legacy.default-agent-owner.js";
 import {
   type PersistedSessionStoreOwner,
   resolvePersistedSessionStoreOwnerForKey,
@@ -27,6 +26,7 @@ import {
   commitHookTransformMappingReload,
   hasHookTemplateExpressions,
   type HookMappingResolved,
+  normalizeHookMatchPath,
   resolveHookMappings,
 } from "./hooks-mapping.js";
 import { resolveAllowedAgentIds } from "./hooks-policy.js";
@@ -41,6 +41,8 @@ export type HooksConfigResolved = {
   basePath: string;
   token: string;
   maxBodyBytes: number;
+  /** Producer-derived per-path body bounds (mapping-owned), keyed by normalized match path. */
+  maxBodyBytesByPath: ReadonlyMap<string, number>;
   mappings: HookMappingResolved[];
   agentPolicy: HookAgentPolicyResolved;
   sessionPolicy: HookSessionPolicyResolved;
@@ -77,7 +79,7 @@ export function resolveHooksConfig(cfg: OpenClawConfig): HooksConfigResolved | n
     throw new Error("hooks.path may not be '/'");
   }
   const mappings = resolveHookMappings(cfg.hooks);
-  const defaultAgentId = tryResolveLegacyCompatibilityAgentId(cfg);
+  const defaultAgentId = tryResolveAgentOperationAgentId(cfg);
   // Global hook runs write a literal shared row, whose durable owner must win
   // over ambient hook defaults after migration sidecar state is gone.
   const globalSessionStoreOwner =
@@ -115,6 +117,7 @@ export function resolveHooksConfig(cfg: OpenClawConfig): HooksConfigResolved | n
     basePath: trimmed,
     token,
     maxBodyBytes: DEFAULT_HOOKS_MAX_BODY_BYTES,
+    maxBodyBytesByPath: resolveHookBodyLimitsByPath(mappings),
     mappings,
     agentPolicy: {
       defaultAgentId,
@@ -132,6 +135,30 @@ export function resolveHooksConfig(cfg: OpenClawConfig): HooksConfigResolved | n
 
 export function commitHooksConfigReload(): void {
   commitHookTransformMappingReload();
+}
+
+function resolveHookBodyLimitsByPath(mappings: HookMappingResolved[]): ReadonlyMap<string, number> {
+  const byPath = new Map<string, number>();
+  for (const mapping of mappings) {
+    if (!mapping.matchPath || !mapping.maxBodyBytes) {
+      continue;
+    }
+    const current = byPath.get(mapping.matchPath) ?? DEFAULT_HOOKS_MAX_BODY_BYTES;
+    byPath.set(mapping.matchPath, Math.max(current, mapping.maxBodyBytes));
+  }
+  return byPath;
+}
+
+/** Resolve the body byte bound for one hook sub-path (mapping-derived, floored at the default). */
+export function resolveHookPathBodyLimit(
+  hooksConfig: Pick<HooksConfigResolved, "maxBodyBytes" | "maxBodyBytesByPath">,
+  subPath: string,
+): number {
+  const normalized = normalizeHookMatchPath(subPath);
+  if (!normalized) {
+    return hooksConfig.maxBodyBytes;
+  }
+  return hooksConfig.maxBodyBytesByPath.get(normalized) ?? hooksConfig.maxBodyBytes;
 }
 
 function resolveKnownAgentIds(cfg: OpenClawConfig, defaultAgentId?: string): Set<string> {
@@ -306,6 +333,16 @@ export type HookAgentDispatchPayload = Omit<HookAgentPayload, "sessionKey"> & {
   sourcePath: string;
   allowUnsafeExternalContent?: boolean;
   externalContentSource?: HookExternalContentSource;
+  /** Configured ingress source attribution; never an authenticated principal. */
+  mappingId?: string;
+  /**
+   * "background" admits without the start deadline: the run is never canceled
+   * for admitting slowly, and its eventual result feeds the replay cache.
+   * Fan-out items use it because their producer retries by redelivery — a
+   * fixed admission deadline would cancel every item of a slow cold batch,
+   * cache nothing, and turn each redelivery into the same cold burst forever.
+   */
+  admissionMode?: "bounded" | "background";
 };
 
 const listHookChannelValues = () => ["last", ...listChannelPlugins().map((plugin) => plugin.id)];
@@ -520,15 +557,15 @@ export function resolveEffectiveHookTargetAgentId(
   }
   if (
     persistedOwner.kind === "configured" &&
-    resolvedAgentId &&
-    resolvedAgentId !== persistedOwner.agentId
+    selectedAgentId &&
+    selectedAgentId !== persistedOwner.agentId
   ) {
     return {
       ok: false,
       code: "owner-conflict",
-      agentId: resolvedAgentId,
+      agentId: selectedAgentId,
       ownerAgentId: persistedOwner.agentId,
-      error: `agentId "${resolvedAgentId}" conflicts with global session-store owner "${persistedOwner.agentId}"; use agentId "${persistedOwner.agentId}" or update agents.defaults.sessionStore.agentId`,
+      error: `agentId "${selectedAgentId}" conflicts with global session-store owner "${persistedOwner.agentId}"; use agentId "${persistedOwner.agentId}" or update agents.defaults.sessionStore.agentId`,
     };
   }
   const effectiveAgentId =

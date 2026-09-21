@@ -10,13 +10,16 @@ const SENTINEL_PREFIX_BYTES = Buffer.from(SECRET_SENTINEL_PREFIX);
 const SENTINEL_SUFFIX_BYTES = Buffer.from(SECRET_SENTINEL_SUFFIX);
 
 export type SecretEgressRefusalReason =
+  | "host-not-allowed"
   | "invalid-proxy-auth"
   | "missing-proxy-auth"
   | "non-https-request"
   | "non-https-port"
   | "destination-not-allowed"
   | "unresolved-sentinel"
-  | "upstream-error";
+  | "upstream-error"
+  | "upload-capacity"
+  | "request-timeout";
 
 export class SecretEgressSubstitutionError extends Error {
   constructor(
@@ -74,10 +77,36 @@ function processPendingBuffer(params: {
     if (resolved === undefined) {
       throw new SecretEgressSubstitutionError("unresolved-sentinel");
     }
+    // v2 encodes UTF-8 plus 36 metadata bytes as base64url, so real values
+    // shrink. Enforce this contract before allocation, including custom resolvers.
+    if (Buffer.byteLength(resolved, "utf8") > sentinelEnd) {
+      throw new SecretEgressSubstitutionError("unresolved-sentinel");
+    }
     params.push(Buffer.from(resolved, "utf8"));
     params.onSubstitution();
     pending = pending.subarray(sentinelEnd);
   }
+}
+
+/** Reuses the binary scanner in place; nonexpansion keeps writes behind unread input. */
+export function substituteSecretEgressBody(
+  buffer: Buffer,
+  params: {
+    onSubstitution: () => void;
+    resolveSentinel: (sentinel: string) => string | undefined;
+  },
+): Buffer {
+  let length = 0;
+  processPendingBuffer({
+    ...params,
+    buffer,
+    flush: true,
+    push: (chunk) => {
+      chunk.copy(buffer, length);
+      length += chunk.length;
+    },
+  });
+  return buffer.subarray(0, length);
 }
 
 /** Rewrites process-local sentinels across arbitrary request-body chunk boundaries. */
@@ -101,6 +130,10 @@ export function createSecretEgressBodyTransform(params: {
       } catch (error) {
         callback(error as Error);
       }
+    },
+    destroy(error, callback) {
+      pending = Buffer.alloc(0);
+      callback(error);
     },
     flush(callback: TransformCallback) {
       try {

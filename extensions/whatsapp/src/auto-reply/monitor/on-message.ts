@@ -1,5 +1,9 @@
 // Whatsapp plugin module implements on message behavior.
 import type { AckReactionHandle } from "openclaw/plugin-sdk/channel-feedback";
+import {
+  type ChannelInboundTurnPlan,
+  resolveGroupThreadConfig,
+} from "openclaw/plugin-sdk/channel-inbound";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   ensureConfiguredBindingRouteReady,
@@ -43,6 +47,7 @@ export function createWebOnMessageHandler(params: {
   baseMentionConfig: MentionConfig;
   account: { authDir?: string; accountId?: string; selfChatMode?: boolean };
   buildContext?: typeof import("openclaw/plugin-sdk/channel-inbound").buildChannelInboundEventContext;
+  dispatchReplyFromConfig?: NonNullable<ChannelInboundTurnPlan["dispatchReplyFromConfig"]>;
 }) {
   const hasExplicitlyPassedInboundAccess = (msg: AdmittedWebInboundMessage): boolean =>
     msg.admission.ingress.decision === "allow";
@@ -103,6 +108,7 @@ export function createWebOnMessageHandler(params: {
       replyLogger: params.replyLogger,
       backgroundTasks: params.backgroundTasks,
       buildContext: params.buildContext,
+      dispatchReplyFromConfig: params.dispatchReplyFromConfig,
     };
     if (opts?.groupHistory !== undefined) {
       processParams.groupHistory = opts.groupHistory;
@@ -389,8 +395,7 @@ export function createWebOnMessageHandler(params: {
 
     const hasBroadcastTargets =
       !configuredRoute.bindingResolution &&
-      Array.isArray(cfg.broadcast?.[peerId]) &&
-      cfg.broadcast[peerId].length > 0;
+      resolveGroupThreadConfig({ cfg, channel: "whatsapp", peerId }) !== undefined;
     if (hasBroadcastTargets && statusReactionController) {
       await clearPreDispatchReaction();
     }

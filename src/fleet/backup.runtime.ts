@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants, createWriteStream, type Stats } from "node:fs";
+import { createWriteStream, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +12,11 @@ import {
   ArchiveSecurityError,
   extractArchive,
 } from "../infra/archive.js";
-import { createBackupLinkCache } from "../infra/backup-volatile-stat-cache.js";
+import { createBackupVolatileStatCache } from "../infra/backup-volatile-stat-cache.js";
+import {
+  getPublishFileExclusiveFailureDetails,
+  publishFileNoClobber,
+} from "../infra/directory-durability.js";
 import { formatErrorMessage as errorMessage } from "../infra/errors.js";
 import { root as fsSafeRoot } from "../infra/fs-safe.js";
 import { isPathInside } from "../infra/path-guards.js";
@@ -298,7 +302,7 @@ export async function backupFleetCell(params: {
           gzip: true,
           portable: true,
           preservePaths: true,
-          linkCache: createBackupLinkCache(),
+          statCache: createBackupVolatileStatCache(() => false),
           filter,
           onWriteEntry: (entry) => {
             entry.path = remapArchivePath(entry.path, manifestPath, dataTarget, authTarget);
@@ -306,8 +310,8 @@ export async function backupFleetCell(params: {
         },
         [manifestPath, dataTarget, authTarget],
       ),
-      // Stream to a same-directory temp path first: a killed process must not
-      // leave a truncated file under the final archive name.
+      // Finish streaming into a same-directory temp path before publication;
+      // filesystems without hard-link support still need a non-atomic copy.
       createWriteStream(tempArchivePath, { flags: "wx", mode: 0o600 }),
     );
     // A single large file can stream past the lease TTL without a filter
@@ -338,7 +342,25 @@ export async function backupFleetCell(params: {
         `Fleet backup refuses a file name its restore path rules would reject: ${unrestorablePath}. Rename the file inside the cell and retry.`,
       );
     }
-    await publishArchive(tempArchivePath, archivePath);
+    try {
+      await publishFileNoClobber(tempArchivePath, archivePath, {
+        strategy: "link-or-copy",
+        durability: "degrade",
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`Refusing to overwrite existing fleet backup archive: ${archivePath}`, {
+          cause: error,
+        });
+      }
+      if (getPublishFileExclusiveFailureDetails(error)?.cleanup === "unknown") {
+        throw new Error(
+          `Fleet backup publication failed: ${errorMessage(error)}. A partial archive may remain at ${archivePath}; inspect or remove it before retrying.`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     return {
       tenant: params.record.tenantId,
       archivePath,
@@ -353,41 +375,9 @@ export async function backupFleetCell(params: {
   }
 }
 
-// Publish with no-overwrite semantics after every check passed: hard-link the
-// temp file to the final name when supported, else exclusive copy. EEXIST from
-// either path means another process owns the destination.
-async function publishArchive(tempArchivePath: string, archivePath: string): Promise<void> {
-  try {
-    await fs.link(tempArchivePath, archivePath);
-    return;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "EEXIST") {
-      throw new Error(`Refusing to overwrite existing fleet backup archive: ${archivePath}`, {
-        cause: error,
-      });
-    }
-    if (code !== "ENOTSUP" && code !== "EOPNOTSUPP" && code !== "EPERM") {
-      throw error;
-    }
-  }
-  try {
-    await fs.copyFile(tempArchivePath, archivePath, fsConstants.COPYFILE_EXCL);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error(`Refusing to overwrite existing fleet backup archive: ${archivePath}`, {
-        cause: error,
-      });
-    }
-    await fs.rm(archivePath, { force: true }).catch(() => undefined);
-    throw error;
-  }
-}
-
 function isAllowedRestorePath(rawPath: string): boolean {
-  // Fleet archives use POSIX separators only. A literal backslash would
-  // validate as one path but extract as another on POSIX, so it is rejected
-  // outright at both backup and restore time.
+  // Backup writes canonical POSIX names; restore receives fs-safe's canonical
+  // paths. Reject raw aliases here when validating backup source names.
   if (rawPath.includes("\\")) {
     return false;
   }
@@ -683,21 +673,25 @@ export async function restoreFleetCell(params: {
       ),
     );
 
+    // Restore decided to displace the generation inspected above, so every
+    // re-validation below re-inspects that identity rather than the cell name.
+    // Re-inspecting the name would let a container that claimed it in the
+    // meantime pass the ownership guard and be stopped or removed instead.
     if (wasRunning) {
       params.checkpoint();
-      assertManagedInspection(
+      const running = assertManagedInspection(
         params.record,
-        await params.containers.inspect(params.record.runtime, params.record.containerName),
+        await params.containers.inspect(params.record.runtime, inspection.containerId),
       );
-      await params.containers.stop(params.record.runtime, params.record.containerName);
+      await params.containers.stop(params.record.runtime, running.containerId);
       stoppedForRestore = true;
     }
     params.checkpoint();
-    assertManagedInspection(
+    const removable = assertManagedInspection(
       params.record,
-      await params.containers.inspect(params.record.runtime, params.record.containerName),
+      await params.containers.inspect(params.record.runtime, inspection.containerId),
     );
-    await params.containers.remove(params.record.runtime, params.record.containerName, false);
+    await params.containers.remove(params.record.runtime, removable.containerId, false);
     containerRemoved = true;
     params.checkpoint();
     previousDisplaced = true;
@@ -760,7 +754,7 @@ export async function restoreFleetCell(params: {
           current.labels[FLEET_ATTEMPT_LABEL] === replacementAttemptId &&
           current.running
         ) {
-          await params.containers.stop(params.record.runtime, params.record.containerName);
+          await params.containers.stop(params.record.runtime, current.containerId);
           replacementNote =
             " The interrupted replacement container was stopped; retry fleet restore to rotate a fresh Gateway token.";
         } else if (current.kind === "unavailable") {
@@ -790,15 +784,14 @@ export async function restoreFleetCell(params: {
       // Restart the same managed generation so an aborted restore does not
       // strand a healthy tenant stopped; the original error stays primary.
       try {
+        // Same generation by identity, so no attempt-label comparison is needed:
+        // the cell name may already point at something this must not start.
         const current = assertManagedInspection(
           params.record,
-          await params.containers.inspect(params.record.runtime, params.record.containerName),
+          await params.containers.inspect(params.record.runtime, inspection.containerId),
         );
-        if (
-          !current.running &&
-          current.labels[FLEET_ATTEMPT_LABEL] === inspection.labels[FLEET_ATTEMPT_LABEL]
-        ) {
-          await params.containers.start(params.record.runtime, params.record.containerName);
+        if (!current.running) {
+          await params.containers.start(params.record.runtime, current.containerId);
         }
       } catch {
         // Best-effort recovery; the container remains stopped but intact.

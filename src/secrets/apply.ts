@@ -12,10 +12,10 @@ import {
   loadPersistedSharedAuthProfileStore,
 } from "../agents/auth-profiles/persisted.js";
 import { resolveAuthProfileDatabasePath } from "../agents/auth-profiles/sqlite.js";
+import { saveAuthProfileStoreIfPersistenceSnapshotMatches } from "../agents/auth-profiles/store-runtime.js";
 import {
   captureAuthProfileStorePersistenceSnapshot,
   restoreAuthProfileStorePersistenceSnapshot,
-  saveAuthProfileStoreIfPersistenceSnapshotMatches,
 } from "../agents/auth-profiles/store.js";
 import { normalizeProviderId } from "../agents/model-selection.js";
 import {
@@ -33,7 +33,7 @@ import {
   listAuthProfileStoreTargets as listDiscoveredAuthProfileStoreTargets,
   type AuthProfileStoreTarget,
 } from "./auth-store-paths.js";
-import { createSecretsConfigIO } from "./config-io.js";
+import { createSecretsConfigIO, writeTextFileAtomic } from "./config-io.js";
 import { getSkippedExecRefStaticError } from "./exec-resolution-policy.js";
 import { deletePathStrict, getPath, setPathCreateStrict } from "./path-utils.js";
 import {
@@ -46,7 +46,7 @@ import { listKnownSecretEnvVarNames } from "./provider-env-vars.js";
 import { resolveSecretRefValue } from "./resolve.js";
 import { prepareSecretsRuntimeSnapshot } from "./runtime.js";
 import { assertExpectedResolvedSecretValue } from "./secret-value.js";
-import { isNonEmptyString, isRecord, writeTextFileAtomic } from "./shared.js";
+import { isNonEmptyString, isRecord } from "./shared.js";
 import { listSecretsDotEnvPaths, parseEnvAssignmentValue } from "./storage-scan.js";
 
 type FileSnapshot = {
@@ -68,6 +68,7 @@ type AuthStoreSnapshot = {
 };
 
 type ProjectedState = {
+  authStoreEnv: NodeJS.ProcessEnv;
   nextConfig: OpenClawConfig;
   configSnapshot: ConfigFileSnapshot;
   configPath: string;
@@ -293,6 +294,10 @@ async function projectPlanState(params: {
   const options = normalizeSecretsPlanOptions(params.plan.options);
   const nextConfig = structuredClone(snapshot.config);
   const stateDir = resolveStateDir(params.env, os.homedir);
+  const authStoreEnv = {
+    ...params.env,
+    OPENCLAW_STATE_DIR: stateDir,
+  };
   const changedFiles = new Set<string>();
   const warnings: string[] = [];
   const configPath = resolveUserPath(snapshot.path);
@@ -353,6 +358,7 @@ async function projectPlanState(params: {
 
   return {
     nextConfig,
+    authStoreEnv,
     configSnapshot: snapshot,
     configPath,
     configWriteOptions: writeOptions,
@@ -420,11 +426,11 @@ function applyConfigTargetMutations(params: {
       if (isNonEmptyString(previous)) {
         scrubbedValues.add(previous.trim());
       }
-      const refPathSegments = resolved.refPathSegments;
-      if (!refPathSegments) {
+      const refPathTokens = resolved.refPathTokens;
+      if (!refPathTokens) {
         throw new Error(`Missing sibling ref path for target ${target.type}.`);
       }
-      const wroteRef = setPathCreateStrict(params.nextConfig, refPathSegments, target.ref);
+      const wroteRef = setPathCreateStrict(params.nextConfig, refPathTokens, target.ref);
       const deletedLegacy = deletePathStrict(params.nextConfig, targetPathSegments);
       if (wroteRef || deletedLegacy) {
         configChanged = true;
@@ -436,7 +442,7 @@ function applyConfigTargetMutations(params: {
     if (isNonEmptyString(previous)) {
       scrubbedValues.add(previous.trim());
     }
-    const wroteRef = setPathCreateStrict(params.nextConfig, targetPathSegments, target.ref);
+    const wroteRef = setPathCreateStrict(params.nextConfig, resolved.pathTokens, target.ref);
     if (wroteRef) {
       configChanged = true;
     }
@@ -678,11 +684,11 @@ function applyAuthProfileTargetMutation(params: {
     if (isNonEmptyString(previous)) {
       params.scrubbedValues.add(previous.trim());
     }
-    const refPathSegments = params.resolved.refPathSegments;
-    if (!refPathSegments) {
+    const refPathTokens = params.resolved.refPathTokens;
+    if (!refPathTokens) {
       throw new Error(`Missing sibling ref path for auth-profiles target ${params.target.path}.`);
     }
-    const wroteRef = setPathCreateStrict(store, refPathSegments, params.target.ref);
+    const wroteRef = setPathCreateStrict(store, refPathTokens, params.target.ref);
     const deletedPlaintext = deletePathStrict(store, targetPathSegments);
     changed = changed || wroteRef || deletedPlaintext;
     return changed;
@@ -691,7 +697,7 @@ function applyAuthProfileTargetMutation(params: {
   if (isNonEmptyString(previous)) {
     params.scrubbedValues.add(previous.trim());
   }
-  const wroteRef = setPathCreateStrict(store, targetPathSegments, params.target.ref);
+  const wroteRef = setPathCreateStrict(store, params.resolved.pathTokens, params.target.ref);
   changed = changed || wroteRef;
   return changed;
 }
@@ -827,7 +833,6 @@ function restoreFileSnapshot(pathname: string, snapshot: FileSnapshot): void {
   writeTextFileAtomic(pathname, snapshot.content, snapshot.mode || 0o600);
 }
 
-/** Applies or dry-runs a validated secrets plan across config, auth stores, and scrub targets. */
 /** Applies a normalized secrets plan, or reports file/auth-store changes in dry-run mode. */
 export async function runSecretsApply(params: {
   plan: SecretsApplyPlan;
@@ -894,7 +899,9 @@ export async function runSecretsApply(params: {
         target,
         persistence: captureAuthProfileStorePersistenceSnapshot(
           target.kind === "agent" ? target.agentDir : undefined,
-          target.kind === "shared" ? { stateDir: target.stateDir } : {},
+          {
+            env: target.kind === "shared" ? target.env : projected.authStoreEnv,
+          },
         ),
       });
     }

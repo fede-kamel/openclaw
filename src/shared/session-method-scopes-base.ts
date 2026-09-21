@@ -5,13 +5,19 @@ export type SessionMutationOperatorScope = "operator.write" | "operator.admin";
 
 const SESSIONS_PATCH_WRITE_SCOPE_MUTATIONS: ReadonlySet<string> = new Set([
   "label",
+  "autoLabel",
   "icon",
+  "color",
   "category",
   "boardFace",
+  "boardPresentation",
   "pinned",
   "archived",
   "unread",
   "model",
+  "agentRuntime",
+  "thinkingLevel",
+  "fastMode",
   "permissionMode",
 ]);
 
@@ -20,6 +26,8 @@ const SESSIONS_PATCH_WRITE_SCOPE_ENVELOPE_FIELDS: ReadonlySet<string> = new Set(
   "agentId",
   "expectedSessionId",
   "expectedLifecycleRevision",
+  "expectedPermissionMode",
+  "expectedMarkedUnreadAt",
 ]);
 
 const SESSIONS_DELETE_WRITE_SCOPE_FIELDS: ReadonlySet<string> = new Set([
@@ -68,6 +76,7 @@ function resolveSessionsCreateRequiredScope(params: unknown): SessionMutationOpe
     (typeof params.parentSessionKey === "string" &&
       isIncognitoSessionKey(params.parentSessionKey)) ||
     Object.hasOwn(params, "execNode") ||
+    Object.hasOwn(params, "toolOverrides") ||
     params.permissionMode === "full"
   ) {
     return "operator.admin";

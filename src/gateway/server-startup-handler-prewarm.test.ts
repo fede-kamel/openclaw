@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import {
   resetGatewayWorkAdmission,
   tryBeginGatewayRootWorkAdmission,
 } from "../process/gateway-work-admission.js";
+import { SIDEBAR_SESSION_ROSTER_LIMIT } from "../shared/session-list-limits.js";
+import { recordAgentDatabaseAdmissions } from "../state/agent-database-admission.js";
 
 const mocks = vi.hoisted(() => ({
   events: [] as string[],
@@ -61,7 +64,40 @@ afterEach(() => {
 });
 
 describe("scheduleGatewayHandlerPrewarm", () => {
-  it("warms bounded session and process-stable plugin data in dashboard order", async () => {
+  it("warms healthy agents without scheduling a refused secondary agent", async () => {
+    vi.useFakeTimers();
+    recordAgentDatabaseAdmissions(
+      [
+        {
+          agentId: "research",
+          embeddedOwnerId: "main",
+          paths: ["/synthetic/research.sqlite"],
+          code: "agent-database-ownership-mismatch",
+          reason: "Refused agent research: database belongs to main.",
+          repairHint: "Preserve the copy and restart after repair.",
+        },
+      ],
+      { source: "startup" },
+    );
+    try {
+      const sidecar = scheduleGatewayHandlerPrewarm({
+        cfgAtStart: { agents: { entries: { main: { default: true }, research: {} } } },
+        log: { warn: vi.fn() },
+      });
+      await vi.runAllTimersAsync();
+      await sidecar.stop();
+      expect(mocks.events).toEqual([
+        "sessions.count",
+        "sessions.load.main",
+        "sessions.rows.main",
+        "plugins",
+      ]);
+    } finally {
+      recordAgentDatabaseAdmissions([], { source: "startup" });
+    }
+  });
+
+  it("warms the sidebar roster page and process-stable plugin data in dashboard order", async () => {
     vi.useFakeTimers();
     const cfg = {
       agents: { list: [{ id: "main", default: true }, { id: "research" }] },
@@ -101,7 +137,7 @@ describe("scheduleGatewayHandlerPrewarm", () => {
           includeDerivedTitles: true,
           includeGlobal: true,
           includeUnknown: true,
-          limit: 60,
+          limit: SIDEBAR_SESSION_ROSTER_LIMIT,
         },
       }),
     );
@@ -110,15 +146,12 @@ describe("scheduleGatewayHandlerPrewarm", () => {
       agentIds: ["main", "research"],
       maxRows: 2_000,
     });
-    sidecar.stop();
+    await sidecar.stop();
   });
 
   it("waits for gateway readiness before warming handler data", async () => {
     vi.useFakeTimers();
-    let releaseGatewayReady!: () => void;
-    const gatewayReady = new Promise<void>((resolve) => {
-      releaseGatewayReady = resolve;
-    });
+    const { promise: gatewayReady, resolve: releaseGatewayReady } = createDeferred();
     const load = vi.fn(async () => {});
 
     const sidecar = scheduleGatewayHandlerPrewarm({
@@ -134,7 +167,7 @@ describe("scheduleGatewayHandlerPrewarm", () => {
     releaseGatewayReady();
     await vi.runAllTimersAsync();
     expect(load).toHaveBeenCalledOnce();
-    sidecar.stop();
+    await sidecar.stop();
   });
 
   it("waits for admitted request work before warming handler data", async () => {
@@ -158,15 +191,12 @@ describe("scheduleGatewayHandlerPrewarm", () => {
     expect(load).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     await vi.waitFor(() => expect(load).toHaveBeenCalledOnce());
-    sidecar.stop();
+    await sidecar.stop();
   });
 
   it("stays stopped when readiness arrives after shutdown", async () => {
     vi.useFakeTimers();
-    let releaseGatewayReady!: () => void;
-    const gatewayReady = new Promise<void>((resolve) => {
-      releaseGatewayReady = resolve;
-    });
+    const { promise: gatewayReady, resolve: releaseGatewayReady } = createDeferred();
     const load = vi.fn(async () => {});
 
     const sidecar = scheduleGatewayHandlerPrewarm({
@@ -177,7 +207,7 @@ describe("scheduleGatewayHandlerPrewarm", () => {
     });
 
     await vi.advanceTimersToNextTimerAsync();
-    sidecar.stop();
+    await sidecar.stop();
     releaseGatewayReady();
     await vi.runAllTimersAsync();
 
@@ -259,8 +289,9 @@ describe("scheduleGatewayHandlerPrewarm", () => {
 
     await vi.advanceTimersToNextTimerAsync();
     expect(first).toHaveBeenCalledOnce();
-    sidecar.stop();
+    const stopping = sidecar.stop();
     releaseFirst();
+    await stopping;
     await vi.runAllTimersAsync();
 
     expect(second).not.toHaveBeenCalled();

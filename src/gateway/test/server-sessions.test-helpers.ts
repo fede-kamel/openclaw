@@ -3,20 +3,23 @@
  */
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import type { AssistantMessage, UserMessage } from "openclaw/plugin-sdk/llm";
-import { afterAll, beforeAll, beforeEach, expect, vi } from "vitest";
+import { beforeEach, expect, vi } from "vitest";
+import { makeAgentAssistantMessage } from "../../agents/test-helpers/agent-message-fixtures.js";
+import { createZeroUsageFixture } from "../../agents/test-helpers/usage-fixtures.js";
 import type { InternalSessionEntry as SessionEntry } from "../../config/sessions.js";
 import type { InternalHookEvent } from "../../hooks/internal-hooks.js";
 import { resetSystemEventsForTest } from "../../infra/system-events.js";
 import { createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
 import { createDirectChatContext } from "../server-chat.agent-events.test-helpers.js";
 import type { GatewayRequestContext } from "../server-methods/types.js";
-import type { GatewayServerHarness } from "../server.e2e-ws-harness.js";
 import { embeddedRunMock, agentDiscoveryMock, testState } from "../test-helpers.runtime-state.js";
-import type { connectOk } from "../test-helpers.server.js";
-import { installGatewayTestHooks, writeSessionStore } from "../test-helpers.server.js";
+import * as gatewayTestHelpers from "../test-helpers.server.js";
+import {
+  installGatewaySessionsTestResources,
+  type GatewaySessionsSuiteSetup,
+} from "./server-sessions-resources.test-helpers.js";
 
 export const getSessionManagerModule = createLazyRuntimeModule(
   () => import("../../agents/sessions/index.js"),
@@ -28,10 +31,6 @@ export const getGatewayConfigModule = createLazyRuntimeModule(
 
 const getSessionAccessorModule = createLazyRuntimeModule(
   () => import("../../config/sessions/session-accessor.js"),
-);
-
-const getGatewayServerHarnessModule = createLazyRuntimeModule(
-  () => import("../server.e2e-ws-harness.js"),
 );
 
 const getGatewayServerMethodsModule = createLazyRuntimeModule(() => import("../server-methods.js"));
@@ -122,7 +121,7 @@ const sessionCleanupMocks = vi.hoisted(() => ({
     );
     return { followupCleared: 0, laneCleared: 0, keys: clearedKeys };
   }),
-  stopSubagentsForRequester: vi.fn(async () => ({ stopped: 0 })),
+  stopSessionResetSubagents: vi.fn(async () => {}),
 }));
 
 const bootstrapCacheMocks = vi.hoisted(() => ({
@@ -202,13 +201,13 @@ vi.mock("../../auto-reply/reply/queue/cleanup.js", async () => {
   };
 });
 
-vi.mock("../../auto-reply/reply/abort.js", async () => {
-  const actual = await vi.importActual<typeof import("../../auto-reply/reply/abort.js")>(
-    "../../auto-reply/reply/abort.js",
-  );
+vi.mock("../../auto-reply/reply/session-reset-cleanup.js", async () => {
+  const actual = await vi.importActual<
+    typeof import("../../auto-reply/reply/session-reset-cleanup.js")
+  >("../../auto-reply/reply/session-reset-cleanup.js");
   return {
     ...actual,
-    stopSubagentsForRequester: sessionCleanupMocks.stopSubagentsForRequester,
+    stopSessionResetSubagents: sessionCleanupMocks.stopSessionResetSubagents,
   };
 });
 
@@ -303,47 +302,30 @@ vi.mock("../../agents/agent-bundle-mcp-tools.js", async (importOriginal) => ({
   retireSessionMcpRuntime: bundleMcpRuntimeMocks.retireSessionMcpRuntime,
 }));
 
-export function setupGatewaySessionsHandlerTestHarness() {
-  const { getHarness, openClient, ...handlerFixture } = createGatewaySessionsTestHarness(false);
-  void getHarness;
-  void openClient;
+export function setupGatewaySessionsHandlerTestHarness(setup?: GatewaySessionsSuiteSetup) {
+  const { getHarness, openClient, ...handlerFixture } = createGatewaySessionsTestHarness(
+    false,
+    setup,
+  );
+  void [getHarness, openClient];
   return handlerFixture;
 }
 
-export function setupGatewaySessionsTestHarness() {
-  return createGatewaySessionsTestHarness(true);
+export function setupGatewaySessionsTestHarness(setup?: GatewaySessionsSuiteSetup) {
+  return createGatewaySessionsTestHarness(true, setup);
 }
 
-function createGatewaySessionsTestHarness(startServer: boolean) {
-  installGatewayTestHooks({ scope: "suite" });
-
-  const defaultAgentWorkspace = path.join(os.tmpdir(), "openclaw-gateway-test");
-  let harness: GatewayServerHarness | undefined;
-  let sharedSessionStoreDir: string | undefined;
+function createGatewaySessionsTestHarness(startServer: boolean, setup?: GatewaySessionsSuiteSetup) {
+  const { defaultAgentWorkspace, requireHarness, requireSharedSessionStoreDir } =
+    installGatewaySessionsTestResources(startServer, setup);
   let sessionStoreCaseSeq = 0;
-
-  beforeAll(async () => {
-    await fs.mkdir(defaultAgentWorkspace, { recursive: true });
-    if (startServer) {
-      const { startGatewayServerHarness } = await getGatewayServerHarnessModule();
-      harness = await startGatewayServerHarness();
-    }
-    sharedSessionStoreDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-sessions-"));
-  });
-
-  afterAll(async () => {
-    await harness?.close();
-    if (sharedSessionStoreDir) {
-      await fs.rm(sharedSessionStoreDir, { recursive: true, force: true });
-    }
-  });
 
   beforeEach(async () => {
     const { clearConfigCache, clearRuntimeConfigSnapshot } = await getGatewayConfigModule();
     clearRuntimeConfigSnapshot();
     clearConfigCache();
     sessionCleanupMocks.clearSessionQueues.mockClear();
-    sessionCleanupMocks.stopSubagentsForRequester.mockClear();
+    sessionCleanupMocks.stopSessionResetSubagents.mockClear();
     bootstrapCacheMocks.clearBootstrapSnapshot.mockReset();
     sessionHookMocks.hasInternalHookListeners.mockReset();
     sessionHookMocks.hasInternalHookListeners.mockReturnValue(true);
@@ -382,29 +364,17 @@ function createGatewaySessionsTestHarness(startServer: boolean) {
     });
   });
 
-  const requireHarness = () => {
-    if (!harness) {
-      throw new Error("Gateway sessions test harness was not started");
-    }
-    return harness;
+  const openClient = async (opts?: Parameters<typeof gatewayTestHelpers.connectOk>[1]) => {
+    await gatewayTestHelpers.prepareGatewayReplyRuntimeForTest({ force: true });
+    return await requireHarness().openClient(opts);
   };
-
-  const requireSharedSessionStoreDir = () => {
-    if (!sharedSessionStoreDir) {
-      throw new Error("Gateway sessions shared session store dir was not created");
-    }
-    return sharedSessionStoreDir;
-  };
-
-  const openClient = async (opts?: Parameters<typeof connectOk>[1]) =>
-    await requireHarness().openClient(opts);
 
   async function createSessionStoreDir() {
     const dir = path.join(requireSharedSessionStoreDir(), `case-${sessionStoreCaseSeq++}`);
     await fs.mkdir(dir, { recursive: true });
-    const storePath = path.join(dir, "sessions.json");
-    testState.sessionStorePath = storePath;
-    return { dir, storePath };
+    testState.sessionStorePath = path.join(dir, "sessions.json");
+    (await getGatewayConfigModule()).clearRuntimeConfigSnapshot(); // A suite server may prewarm before case setup.
+    return { dir, storePath: testState.sessionStorePath };
   }
 
   async function createSelectedGlobalSessionStore() {
@@ -433,7 +403,7 @@ function createGatewaySessionsTestHarness(startServer: boolean) {
     testState.sessionStorePath = storeTemplate;
     testState.sessionConfig = { scope: "global" };
     if (writePrimeStore) {
-      await writeSessionStore({
+      await gatewayTestHelpers.writeSessionStore({
         entries: {},
         storePath: path.join(dir, "prime-sessions.json"),
       });
@@ -443,14 +413,14 @@ function createGatewaySessionsTestHarness(startServer: boolean) {
     const workStorePath = storeTemplate.replace("{agentId}", "work");
     await fs.mkdir(path.dirname(mainStorePath), { recursive: true });
     await fs.mkdir(path.dirname(workStorePath), { recursive: true });
-    await writeSessionStore({
+    await gatewayTestHelpers.writeSessionStore({
       agentId: "main",
       entries: {
         global: sessionStoreEntry("sess-main-global"),
       },
       storePath: mainStorePath,
     });
-    await writeSessionStore({
+    await gatewayTestHelpers.writeSessionStore({
       agentId: "work",
       entries: {
         global: sessionStoreEntry("sess-work-global", {
@@ -526,7 +496,7 @@ function createGatewaySessionsTestHarness(startServer: boolean) {
   async function seedActiveMainSession() {
     const { dir, storePath } = await createSessionStoreDir();
     await writeSingleLineSession(dir, "sess-main", "hello");
-    await writeSessionStore({
+    await gatewayTestHelpers.writeSessionStore({
       entries: {
         main: sessionStoreEntry("sess-main"),
       },
@@ -584,29 +554,18 @@ export async function createCheckpointFixture(
     content: "before compaction",
     timestamp: Date.now(),
   };
-  const assistantMessage: AssistantMessage = {
-    role: "assistant",
+  const assistantMessage: AssistantMessage = makeAgentAssistantMessage({
     content: [{ type: "text", text: "working on it" }],
     api: "responses",
-    provider: "openai",
     model: "gpt-test",
     usage: {
+      ...createZeroUsageFixture(),
       input: 1,
       output: 1,
-      cacheRead: 0,
-      cacheWrite: 0,
       totalTokens: 2,
-      cost: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        total: 0,
-      },
     },
-    stopReason: "stop",
     timestamp: Date.now(),
-  };
+  });
   session.appendMessage(userMessage);
   session.appendMessage(assistantMessage);
   const preCompactionLeafId = session.getLeafId();
@@ -646,11 +605,15 @@ export function expectActiveRunCleanup(
   requesterSessionKey: string,
   expectedQueueKeys: string[],
   sessionId: string,
+  requesterAgentId: string,
 ) {
-  expect(sessionCleanupMocks.stopSubagentsForRequester).toHaveBeenCalledWith({
-    cfg: expect.any(Object),
-    requesterSessionKey,
-  });
+  expect(sessionCleanupMocks.stopSessionResetSubagents).toHaveBeenCalledWith(
+    expect.objectContaining({
+      cfg: expect.any(Object),
+      sessionKey: requesterSessionKey,
+      agentId: requesterAgentId,
+    }),
+  );
   expectSessionQueueCleanup(expectedQueueKeys);
   expect(embeddedRunMock.abortCalls).toEqual([sessionId]);
   expect(embeddedRunMock.waitCalls).toEqual([sessionId]);
@@ -683,14 +646,37 @@ export async function directSessionReq<TPayload = unknown>(
     sessionMutationAuthorization?: SessionsHandlerOptions["sessionMutationAuthorization"];
     coercePayload?: (payload: unknown) => TPayload;
   },
-): Promise<{ ok: boolean; payload?: TPayload; error?: { code?: string; message?: string } }> {
+): Promise<{
+  ok: boolean;
+  payload?: TPayload;
+  error?: { code?: string; message?: string; details?: unknown };
+}> {
   const sessionsHandlers = await getSessionsHandlers();
   const { getRuntimeConfig } = await getGatewayConfigModule();
   const loadGatewayModelCatalog =
     (opts?.context?.loadGatewayModelCatalog as GatewayRequestContext["loadGatewayModelCatalog"]) ??
     (async () => agentDiscoveryMock.models);
+  const loadGatewayModelCatalogSnapshot: GatewayRequestContext["loadGatewayModelCatalogSnapshot"] =
+    (opts?.context
+      ?.loadGatewayModelCatalogSnapshot as GatewayRequestContext["loadGatewayModelCatalogSnapshot"]) ??
+    (async (request) => {
+      const entries = await loadGatewayModelCatalog(request);
+      return {
+        entries,
+        routeVariants: entries,
+        agentId: request?.agentId ?? "main",
+        agentDir: "/tmp/session-catalog-agent",
+        workspaceDir: "/tmp/session-catalog-workspace",
+        config: getRuntimeConfig(),
+        catalogComplete: true,
+      };
+    });
   let result:
-    | { ok: boolean; payload?: TPayload; error?: { code?: string; message?: string } }
+    | {
+        ok: boolean;
+        payload?: TPayload;
+        error?: { code?: string; message?: string; details?: unknown };
+      }
     | undefined;
   const handler = sessionsHandlers[method];
   if (!handler) {
@@ -719,7 +705,11 @@ export async function directSessionReq<TPayload = unknown>(
       dedupe: new Map(),
       getSessionEventSubscriberConnIds: () => new Set<string>(),
       loadGatewayModelCatalog,
-      readPreparedGatewayModelCatalog: loadGatewayModelCatalog,
+      loadGatewayModelCatalogSnapshot,
+      readPreparedGatewayModelCatalog: async () => {
+        const catalog = await loadGatewayModelCatalogSnapshot();
+        return { entries: catalog.entries, routeVariants: catalog.routeVariants };
+      },
       getRuntimeConfig,
       ...opts?.context,
     } as never,

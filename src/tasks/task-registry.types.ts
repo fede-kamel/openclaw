@@ -12,7 +12,7 @@ export type JsonValue =
 
 /** Runtime families that own task run lifecycles. */
 export const TASK_RUNTIMES = ["subagent", "acp", "cron", "cli"] as const;
-export const TASK_STATUSES = [
+const TASK_STATUSES = [
   "queued",
   "running",
   "succeeded",
@@ -21,9 +21,22 @@ export const TASK_STATUSES = [
   "cancelled",
   "lost",
 ] as const;
+export const TASK_STATUS_FILTERS = [...TASK_STATUSES, "blocked"] as const;
 
 export type TaskRuntime = (typeof TASK_RUNTIMES)[number];
 export type TaskStatus = (typeof TASK_STATUSES)[number];
+export type TaskStatusFilter = (typeof TASK_STATUS_FILTERS)[number];
+
+/** Returns whether a task status is terminal for delivery and retention policy. */
+export function isTerminalTaskStatus(status: TaskStatus): boolean {
+  return (
+    status === "succeeded" ||
+    status === "failed" ||
+    status === "timed_out" ||
+    status === "cancelled" ||
+    status === "lost"
+  );
+}
 
 export type TaskDeliveryStatus =
   | "pending"
@@ -42,6 +55,17 @@ export type TaskScopeKind = "session" | "system";
 
 export type TaskStatusCounts = Record<TaskStatus, number>;
 export type TaskRuntimeCounts = Record<TaskRuntime, number>;
+
+export function matchesTaskStatusFilter(
+  task: Pick<TaskRecord, "status" | "terminalOutcome">,
+  filter: TaskStatusFilter,
+): boolean {
+  // Blocked delivery is projected over a persisted success, so succeeded filters must keep matching.
+  return (
+    task.status === filter ||
+    (filter === "blocked" && task.status === "succeeded" && task.terminalOutcome === "blocked")
+  );
+}
 
 const TASK_RUNTIME_SET = new Set<TaskRuntime>(TASK_RUNTIMES);
 const TASK_STATUS_SET = new Set<TaskStatus>(TASK_STATUSES);
@@ -120,6 +144,12 @@ export type TaskDeliveryState = {
   lastNotifiedEventAt?: number;
 };
 
+export type TaskExecutionOwner = {
+  host: string;
+  pid: number;
+  startIdentity: number;
+};
+
 export type TaskRecord = {
   taskId: string;
   runtime: TaskRuntime;
@@ -136,6 +166,7 @@ export type TaskRecord = {
    * Task authorization remains keyed by ownerKey. */
   requesterAgentId?: string;
   runId?: string;
+  executionOwner?: TaskExecutionOwner;
   label?: string;
   task: string;
   status: TaskStatus;

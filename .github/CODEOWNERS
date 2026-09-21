@@ -3,8 +3,9 @@
 
 # WARNING: GitHub CODEOWNERS uses last-match-wins semantics.
 # If you add overlapping rules below the secops block, include @openclaw/openclaw-secops
-# on those entries too or you can silently remove required secops review.
-# Security-sensitive code, config, and docs require secops review.
+# on those entries too or you can silently remove secops review routing.
+# Security-sensitive code, config, and docs require secops owner involvement
+# under repository policy. Live branch/ruleset settings decide merge enforcement.
 /SECURITY.md @openclaw/openclaw-secops
 /.github/dependabot.yml @openclaw/openclaw-secops
 /.github/codeql/ @openclaw/openclaw-secops
@@ -52,8 +53,10 @@
 /docs/gateway/authentication.md @openclaw/openclaw-secops
 /docs/gateway/sandbox-vs-tool-policy-vs-elevated.md @openclaw/openclaw-secops
 /docs/gateway/sandboxing.md @openclaw/openclaw-secops
+/docs/gateway/sandboxing/ @openclaw/openclaw-secops
 /docs/gateway/secrets-plan-contract.md @openclaw/openclaw-secops
 /docs/gateway/secrets.md @openclaw/openclaw-secops
+/docs/gateway/secrets/ @openclaw/openclaw-secops
 /docs/gateway/security/ @openclaw/openclaw-secops
 /docs/cli/approvals.md @openclaw/openclaw-secops
 /docs/cli/sandbox.md @openclaw/openclaw-secops

@@ -1,4 +1,4 @@
-// Subagent registry helper tests cover orphan reconciliation and compact logging
+// Subagent registry helper tests cover attachment cleanup and compact logging
 // for announce delivery give-up paths.
 import { promises as fs } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,8 +7,6 @@ import { updateSwarmCollectorCompletion } from "../swarm/swarm-collector.js";
 import {
   capFrozenResultText,
   logAnnounceGiveUp,
-  reconcileOrphanedRestoredRuns,
-  reconcileOrphanedRun,
   resolveAnnounceRetryDelayMs,
   safeRemoveAttachmentsDir,
   updateSubagentArchiveAtMs,
@@ -186,48 +184,6 @@ describe("updateSubagentArchiveAtMs", () => {
   });
 });
 
-describe("reconcileOrphanedRestoredRuns", () => {
-  it("keeps waitable collector tombstones after delete-mode sessions disappear", () => {
-    const entry = createRunEntry({
-      collect: true,
-      cleanup: "delete",
-      execution: { status: "terminal", startedAt: 1_000, endedAt: 2_000 },
-      completion: { required: false, resultText: "done", capturedAt: 2_000 },
-      collectorCompletion: { status: "done" },
-    });
-    const runs = new Map([[entry.runId, entry]]);
-
-    expect(reconcileOrphanedRestoredRuns({ runs, resumedRuns: new Set() })).toBe(false);
-    expect(runs.get(entry.runId)).toBe(entry);
-  });
-
-  it.each(["reserved", "attempted", "consumed", "accepted", "abandoned"] as const)(
-    "preserves orphaned restart recovery rows in the %s phase",
-    (phase) => {
-      const entry = createRunEntry({
-        execution: {
-          status: "interrupted",
-          startedAt: 1_000,
-          restartRecovery: {
-            sessionId: "session-1",
-            sessionMarker: "session-1:1000",
-            idempotencyKey: "subagent-recovery:receipt",
-            phase,
-            ...(phase === "reserved" ? {} : { lifecycleGeneration: "generation-1" }),
-          },
-        },
-      });
-      const runs = new Map([[entry.runId, entry]]);
-      const resumedRuns = new Set([entry.runId]);
-
-      expect(reconcileOrphanedRestoredRuns({ runs, resumedRuns })).toBe(false);
-      expect(runs.get(entry.runId)).toBe(entry);
-      expect(resumedRuns.has(entry.runId)).toBe(true);
-      expect(entry.execution.restartRecovery?.phase).toBe(phase);
-    },
-  );
-});
-
 describe("safeRemoveAttachmentsDir", () => {
   it("reports non-ENOENT realpath failures instead of treating cleanup as complete", async () => {
     const realpathSpy = vi
@@ -244,35 +200,6 @@ describe("safeRemoveAttachmentsDir", () => {
     ).resolves.toBe(false);
 
     realpathSpy.mockRestore();
-  });
-});
-
-describe("reconcileOrphanedRun", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("removes orphaned runs without publishing a discarded terminal projection", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(4_000);
-    const entry = createRunEntry();
-    const runs = new Map([[entry.runId, entry]]);
-    const resumedRuns = new Set([entry.runId]);
-
-    expect(
-      reconcileOrphanedRun({
-        runId: entry.runId,
-        entry,
-        reason: "missing-session-id",
-        source: "resume",
-        runs,
-        resumedRuns,
-      }),
-    ).toBe(true);
-
-    expect(entry.execution).toEqual({ status: "running", startedAt: 1_000 });
-    expect(runs.has(entry.runId)).toBe(false);
-    expect(resumedRuns.has(entry.runId)).toBe(false);
   });
 });
 

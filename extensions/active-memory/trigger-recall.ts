@@ -1,5 +1,6 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
+  isAutomaticMemoryEntryEligible,
   stripMemoryAnnotationCarriers,
   type MemorySearchResult,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
@@ -56,7 +57,7 @@ function scoreTriggerPhrase(message: string, phrase: string): number {
 }
 
 export function isPromotedTrustedMemoryEntry(
-  entry: Pick<MemorySearchResult, "path" | "source" | "originClass" | "projectKey">,
+  entry: Pick<MemorySearchResult, "provenance" | "projectKey" | "source">,
   activeProjectKeys: readonly string[] = [],
 ): boolean {
   if (entry.projectKey) {
@@ -77,14 +78,7 @@ export function isPromotedTrustedMemoryEntry(
       return false;
     }
   }
-  if (entry.originClass === "owner" || entry.originClass === "agent") {
-    return true;
-  }
-  if (entry.source !== "memory") {
-    return false;
-  }
-  const normalized = entry.path.replaceAll("\\", "/").replace(/^\.\//u, "").toUpperCase();
-  return normalized === "MEMORY.MD" || normalized === "USER.MD";
+  return entry.source === "memory" && isAutomaticMemoryEntryEligible(entry);
 }
 
 export function scoreTriggerMatch(message: string, entry: MemorySearchResult): number {
@@ -137,6 +131,8 @@ type TriggerLookupParams = {
   activeProjectKeys?: string[];
   signal?: AbortSignal;
   runId?: string;
+  /** Undefined uses legacy query identity; null disables request-local reuse. */
+  requestKey?: string | null;
   authorityFingerprint?: string;
 };
 
@@ -193,17 +189,17 @@ async function loadTriggerRecallCandidates(params: TriggerLookupParams) {
 
 function resolveTriggerRecallCandidates(params: TriggerLookupParams) {
   const runId = params.runId?.trim();
-  if (!runId) {
+  if (!runId || params.requestKey === null) {
     return loadTriggerRecallCandidates(params);
   }
-  const runKey = `${runId}:${params.authorityFingerprint ?? "none"}`;
+  const runKey = `${runId}:${JSON.stringify([params.authorityFingerprint, params.requestKey])}`;
   const existing = triggerRecallRuns.get(runKey);
   const activeProjectKeys = params.activeProjectKeys ?? [];
   if (
     existing &&
     existing.cfg === params.cfg &&
     existing.agentId === params.agentId &&
-    existing.query === params.query &&
+    (params.requestKey !== undefined || existing.query === params.query) &&
     existing.activeProjectKeys.length === activeProjectKeys.length &&
     existing.activeProjectKeys.every((key, index) => key === activeProjectKeys[index])
   ) {
@@ -283,4 +279,4 @@ function waitForTriggerLookup<T>(work: Promise<T>, signal?: AbortSignal): Promis
   });
 }
 
-export { MAX_TRIGGER_CONTEXT_CHARS, STRONG_TRIGGER_MATCH_SCORE };
+export { MAX_TRIGGER_CONTEXT_CHARS };

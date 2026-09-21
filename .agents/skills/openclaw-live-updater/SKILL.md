@@ -14,6 +14,7 @@ Keep one operator-selected canonical live checkout as a read-only-to-the-agent d
 - Escalate only irreversible or materially risky security, privacy, auth, destructive migration/data-loss, protocol-version, credential-rotation, dependency patch/override, or product choices.
 - Diagnose ordinary update, runtime, app, CI, test, and release-validation failures; fix them through a focused PR; prove exact head; land with `scripts/pr`.
 - Never edit, stash, reset, clean, or create a branch in the live mirror.
+- Never use `launchctl submit` or create an ad-hoc KeepAlive job to run updates or Gateway lifecycle commands. A submitted job can relaunch `openclaw gateway restart` after every exit and cause a persistent restart storm, even without a plist ([#114967](https://github.com/openclaw/openclaw/issues/114967)).
 
 ## Fast Update And Maintenance
 
@@ -38,6 +39,8 @@ Keep one operator-selected canonical live checkout as a read-only-to-the-agent d
 
    Treat supervisor state alone as insufficient. If build or proof fails, leave the new mirror head intact and retry the stale/missing build on the next heartbeat; never run the old `dist` against new source.
 
+   Keep the deterministic helper as the only update/restart owner: acquire its maintenance suspension fence, complete the update and exact-SHA build, restart the managed LaunchAgent through that helper, and verify with status and health. Leave only the managed Gateway LaunchAgent responsible for its lifecycle. `gateway status` and `doctor` report foreign `ai.openclaw.*` jobs; report any such job instead of creating another update job or manually removing a job whose ownership is uncertain. `doctor --fix` can remove confirmed stray lifecycle jobs when separately authorized; it is not a substitute for the suspension fence.
+
    Re-run the canonical freshness check immediately before every `pnpm openclaw` restart or probe so the source runner cannot hide stale output with an implicit auto-build. Every pass, including a no-update/current-build pass, must run deep RPC status and verbose health. If that first probe fails while the build is already exact-current, perform one managed Gateway restart and repeat both probes once. Do not rebuild a current exact-SHA artifact merely to self-heal the managed process; fail and diagnose if the one restart does not recover it.
 
 3. If changed paths can affect macOS, the helper runs `scripts/restart-mac.sh --sign --wait --target-only` with `SKIP_TSC=1` and `SKIP_UI_BUILD=1` only after the exact-SHA JS/UI build completes. Reusing those artifacts keeps the live app bundle out of any later JavaScript build cleanup. Target-only mode may stop the canonical `/Applications/OpenClaw.app` process and this checkout's exact `dist` process before launching the rebuilt `dist` app. It defers when another worktree, temporary bundle, test, or agent-owned OpenClaw process is active; it never kills that process. The script's immediate `OK` is not proof. The helper waits and requires the exact executable `<canonical-live-checkout>/dist/OpenClaw.app/Contents/MacOS/OpenClaw`, derived from the verified checkout, then repeats Gateway RPC and health proof.
@@ -59,19 +62,18 @@ Load `$release-openclaw-ci` and `$openclaw-testing`. This is validation only, ne
 
    ```bash
    MAIN_SHA="<exact-main-sha>"
-   gh workflow run full-release-validation.yml \
-     --repo openclaw/openclaw \
-     --ref main \
-     -f ref="$MAIN_SHA" \
-     -f expected_sha="$MAIN_SHA" \
+   pnpm ci:full-release \
+     -f validation_purpose=main-qualification \
+     --sha "$MAIN_SHA" \
+     --workflow-sha "$MAIN_SHA" \
      -f provider=openai \
      -f mode=both \
      -f release_profile=full \
      -f rerun_group=all
    ```
 
-3. Watch the parent with `release-ci-summary.mjs`; require its recorded target SHA and children to match the dispatch snapshot. Fetch logs only for failed or blocking jobs. Do not cancel unrelated release checks.
-4. For a code or harness failure, repair and land from the Codex worktree as above. Then target new exact `main` with the narrowest supported `rerun_group` that covers the failed child; use `live_suite_filter` for one live/E2E shard. A targeted recovery run does not create a second full/all cadence dispatch.
+3. Let the helper watch the parent to terminal and verify its release evidence. Retain its parent URL and require the recorded target SHA and children to match the dispatch snapshot. Fetch logs only for failed or blocking jobs. Do not cancel unrelated release checks.
+4. For a code or harness failure, repair and land from the Codex worktree as above. Then invoke the same helper with a new frozen exact-main tuple and the narrowest supported `rerun_group` that covers the failed child; use `live_suite_filter` for one live/E2E shard. A targeted recovery run does not create a second full/all cadence dispatch.
 5. Report exact SHA, parent and child run URLs/IDs, conclusions, repairs and landed PRs, targeted reruns, and any genuine proof gap. Do not write release evidence or publish artifacts unless separately authorized.
 
 ## Failure Discipline

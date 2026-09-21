@@ -19,7 +19,7 @@ import {
   PROTOCOL_VERSION,
 } from "@openclaw/gateway-protocol/version";
 import { redactSensitiveUrlLikeString } from "@openclaw/net-policy/redact-sensitive-url";
-import { WebSocket } from "ws";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   isSensitiveUrlQueryParamName,
   normalizeTlsFingerprint,
@@ -33,6 +33,7 @@ import {
   shouldRetryGatewayWithDeviceToken,
 } from "./connect-auth.js";
 import { buildDeviceAuthPayloadV3 } from "./device-auth.js";
+import { resolveModelCatalogConnect } from "./model-catalog-connect.js";
 import {
   GatewayProtocolClient,
   type GatewayProtocolCloseContext,
@@ -58,6 +59,7 @@ import {
   isGatewayLoopbackHost,
   resolveGatewayWebSocketTransport,
 } from "./websocket-transport.js";
+import { WebSocket } from "./websocket.js";
 
 export type DeviceIdentity = {
   deviceId: string;
@@ -204,6 +206,7 @@ export type GatewayClientCloseInfo = {
 };
 
 export { GatewayClientRequestError } from "./request-error.js";
+export { isGatewayProtocolResponseError } from "./protocol-request.js";
 
 export class GatewayClientRequestTimeoutError extends GatewayProtocolRequestTimeoutError {
   constructor(params: { method: string; timeoutMs: number; requestSent: boolean }) {
@@ -264,9 +267,11 @@ export type GatewayClientOptions = {
   clientBuildId?: string;
   platform?: string;
   deviceFamily?: string;
+  modelIdentifier?: string;
   mode?: GatewayClientMode;
   role?: string;
   scopes?: string[];
+  modelCatalog?: ConnectParams["modelCatalog"];
   caps?: string[];
   commands?: string[];
   computerUse?: ConnectParams["computerUse"];
@@ -384,7 +389,7 @@ export class GatewayClient {
       createRequestTimeoutError: (method, timeoutMs, requestSent) =>
         new GatewayClientRequestTimeoutError({ method, timeoutMs, requestSent }),
       createRequestAbortError: createGatewayRequestAbortError,
-      buildConnectPlan: ({ nonce, challengeTs }) => {
+      buildConnectPlan: ({ nonce, challengeTs, serverCapabilities }) => {
         if (!nonce) {
           throw new Error("gateway connect challenge missing nonce");
         }
@@ -395,6 +400,7 @@ export class GatewayClient {
           role: this.opts.role ?? "operator",
           nonce,
           signedAtMs: challengeTs ?? Date.now(),
+          serverCapabilities,
         });
       },
       buildConnectParams: (assembled) => assembled.params,
@@ -430,6 +436,8 @@ export class GatewayClient {
       },
       notifyStoppedClose: true,
       onConnectError: (error) => this.notifyConnectError(error),
+      onReconnectStopped: (error) =>
+        this.notifyReconnectPaused({ code: 1008, reason: error.message, detailCode: null }),
       onParseError: (error) =>
         this.logDebug(`gateway client parse error: ${formatGatewayClientErrorForLog(error)}`),
       onEvent: (event) => this.opts.onEvent?.(event),
@@ -456,6 +464,12 @@ export class GatewayClient {
         !(error instanceof RangeError),
       rethrowSocketFactoryError: (error) => error instanceof GatewayClientTransportPolicyError,
     });
+  }
+
+  /** Current transport state, including CLOSING before the close callback fires.
+   * This is not authentication or readiness evidence on its own. */
+  get connected(): boolean {
+    return !this.stopped && this.protocol.connected;
   }
 
   getConnectionMetadata(): GatewayClientConnectionMetadata {
@@ -557,14 +571,8 @@ export class GatewayClient {
     this.transportValidated = false;
     let upgradeError: GatewayClientRequestError | undefined;
     ws.on("open", () => {
-      handlers.open();
-      const tlsError = transport.validateSocket(ws);
-      if (tlsError) {
-        handlers.error(tlsError);
-        ws.close(1008, tlsError.message);
-        return;
-      }
       this.transportValidated = true;
+      handlers.open();
     });
     ws.on("message", (data) => handlers.message(rawDataToString(data)));
     ws.on("close", (code, reason) => {
@@ -578,6 +586,14 @@ export class GatewayClient {
     ws.on("unexpected-response", (request: ClientRequest, response: IncomingMessage) => {
       void readUpgradeErrorBody(response).then((body) => {
         const statusCode = response.statusCode;
+        let gatewayError: { type?: unknown; message?: unknown } | undefined;
+        try {
+          const parsed: unknown = JSON.parse(body);
+          const parsedError = isRecord(parsed) ? parsed.error : undefined;
+          gatewayError = isRecord(parsedError) ? parsedError : undefined;
+        } catch {
+          // Plain-text and truncated rejections remain visible in the original error message.
+        }
         const rawLocation = response.headers.location;
         const location = rawLocation
           ? redactSensitiveUrlLikeString(
@@ -593,6 +609,14 @@ export class GatewayClient {
             reason: "websocket-upgrade-rejected",
             ...(statusCode === undefined ? {} : { httpStatus: statusCode }),
             ...(location ? { location } : {}),
+            ...(typeof gatewayError?.type === "string"
+              ? {
+                  gatewayErrorType: gatewayError.type,
+                  ...(typeof gatewayError.message === "string"
+                    ? { gatewayErrorMessage: gatewayError.message }
+                    : {}),
+                }
+              : {}),
           },
         });
         handlers.error(upgradeError);
@@ -603,6 +627,11 @@ export class GatewayClient {
     ws.on("error", (err) => {
       if (upgradeError) {
         return;
+      }
+      // ws abortHandshake emits this timeout without an errno. Normalize it at
+      // the dependency boundary so RPC callers retain socket-unavailable recovery.
+      if (err.message === "Opening handshake has timed out") {
+        Object.assign(err, { code: "ETIMEDOUT" });
       }
       this.logDebug(`gateway client error: ${formatGatewayClientErrorForLog(err)}`);
       handlers.error(err instanceof Error ? err : new Error(String(err)));
@@ -719,6 +748,7 @@ export class GatewayClient {
     role: string;
     nonce: string;
     signedAtMs: number;
+    serverCapabilities: readonly string[];
   }): AssembledConnect {
     const { role, nonce, signedAtMs } = params;
     // Auth selection is intentionally centralized: retry decisions depend on
@@ -794,10 +824,15 @@ export class GatewayClient {
           buildId: this.opts.clientBuildId,
           platform,
           deviceFamily,
+          modelIdentifier: useLegacyNodeProtocolEnvelope ? undefined : this.opts.modelIdentifier,
           mode: clientMode,
           instanceId: this.opts.instanceId,
         },
-        caps: Array.isArray(this.opts.caps) ? this.opts.caps : [],
+        ...resolveModelCatalogConnect({
+          caps: Array.isArray(this.opts.caps) ? this.opts.caps : [],
+          modelCatalog: useLegacyNodeProtocolEnvelope ? undefined : this.opts.modelCatalog,
+          serverCapabilities: params.serverCapabilities,
+        }),
         commands: Array.isArray(this.opts.commands) ? this.opts.commands : undefined,
         computerUse: useLegacyNodeProtocolEnvelope ? undefined : this.opts.computerUse,
         workerRuns: useLegacyNodeProtocolEnvelope ? undefined : this.opts.workerRuns,

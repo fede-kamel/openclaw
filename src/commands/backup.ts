@@ -1,14 +1,14 @@
 // CLI command wrapper for backup archive creation and optional verification.
 import {
   createBackupArchive,
-  formatBackupCreateSummary,
   type BackupCreateOptions,
   type BackupCreateResult,
 } from "../infra/backup-create.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
 import { createLazyImportLoader } from "../shared/lazy-promise.js";
-import { recordBackupRunOutcome } from "../state/backup-run-records.js";
+import { recordBackupOutcomeBestEffort } from "./backup-shared.js";
+import { formatBackupCreateSummary } from "./backup-summary.js";
 
 type BackupVerifyRuntime = typeof import("./backup-verify.js");
 
@@ -44,7 +44,8 @@ export async function backupCreateCommand(
       result.verified = true;
     }
     if (!opts.dryRun) {
-      recordBackupOutcomeBestEffort(runtime, {
+      await recordBackupOutcomeBestEffort(runtime, {
+        kind: "archive",
         archivePath,
         status: "ok",
       });
@@ -57,25 +58,13 @@ export async function backupCreateCommand(
     return result;
   } catch (error) {
     if (!opts.dryRun) {
-      recordBackupOutcomeBestEffort(runtime, {
+      await recordBackupOutcomeBestEffort(runtime, {
+        kind: "archive",
         archivePath,
         status: "failed",
         error: formatErrorMessage(error),
       });
     }
     throw error;
-  }
-}
-
-function recordBackupOutcomeBestEffort(
-  runtime: RuntimeEnv,
-  params: { archivePath: string; status: "ok" | "failed"; error?: string },
-): void {
-  try {
-    recordBackupRunOutcome({ kind: "archive", ...params });
-  } catch (error) {
-    runtime.error(
-      `Warning: the backup outcome could not be recorded: ${formatErrorMessage(error)}`,
-    );
   }
 }

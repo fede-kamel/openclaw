@@ -34,9 +34,9 @@ export {
 } from "../channels/message/ingress-drain.js";
 export {
   CHANNEL_INGRESS_RETENTION_DEFAULTS,
-  createChannelIngressError,
   createChannelIngressMonitor,
 } from "../channels/message/ingress-monitor.js";
+export { createChannelIngressError } from "../channels/message/ingress-errors.js";
 export {
   DEFAULT_INGRESS_RETRY_DEAD_LETTER_MIN_AGE_MS,
   DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS,
@@ -99,8 +99,10 @@ export {
   formatChannelProgressDraftText,
   getChannelStreamingConfigObject,
   isChannelProgressDraftWorkToolName,
-  isPotentialTruncatedFinal,
   formatPlanChecklistLines,
+  selectPlanChecklistSteps,
+  compactChannelProgressDraftLine,
+  isChannelProgressAttentionLine,
   mergeChannelProgressDraftLine,
   normalizeAgentPlanSteps,
   normalizeChannelProgressDraftLineIdentity,
@@ -117,8 +119,6 @@ export {
   resolveChannelStreamingProgressCommentary,
   resolveChannelStreamingProgressNarration,
   resolveChannelStreamingSuppressDefaultToolProgressMessages,
-  resolveTranscriptBackedChannelFinalText,
-  selectLongerFinalText,
 } from "../channels/streaming.js";
 export type {
   AgentPlanStep,
@@ -135,6 +135,7 @@ export {
   createChannelProgressDraftCompositor,
   createChannelProgressWorkCounter,
 } from "../channels/progress-draft-compositor.js";
+export { formatChannelProgressDraftDiffStat } from "../channels/progress-draft-diffstat.js";
 
 /** @deprecated The streaming.progress.render key was retired (#122927). */
 export type ChannelProgressDraftRenderMode = "rich" | "text";
@@ -241,3 +242,9 @@ export async function withDurableMessageSendContext<T>(
   const mod = await loadChannelMessageRuntimeModule();
   return await mod.withDurableMessageSendContextCore(params, run);
 }
+
+export {
+  isPotentialTruncatedFinal,
+  resolveTranscriptBackedChannelFinalText,
+  selectLongerFinalText,
+} from "../channels/streaming-final-text.js";

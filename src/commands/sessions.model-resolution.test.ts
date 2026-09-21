@@ -4,8 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
+import { resolveSqliteTargetFromSessionStorePath } from "../config/sessions/session-sqlite-target.js";
 import type { SessionEntry } from "../config/sessions/types.js";
-import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import { executeSqliteQueryTakeFirstSync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
+import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
+import {
+  closeOpenClawAgentDatabasesForTest,
+  openOpenClawAgentDatabase,
+} from "../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import {
   mockSessionsConfig,
@@ -98,6 +104,14 @@ describe("sessionsCommand model resolution", () => {
   it("falls back to modelOverride when runtime model is missing", async () => {
     const model = await resolveSubagentModel({ modelOverride: "openai/gpt-5.4" }, "subagent-2");
     expect(model).toBe("gpt-5.4");
+  });
+
+  it("preserves nested override models when their provider is recorded separately", async () => {
+    const model = await resolveSubagentModel(
+      { providerOverride: "clawrouter", modelOverride: "openai/gpt-5.6" },
+      "subagent-router-override",
+    );
+    expect(model).toBe("openai/gpt-5.6");
   });
 
   it("separates Claude CLI runtime from canonical model provider in JSON output", async () => {
@@ -202,20 +216,101 @@ describe("sessionsCommand model resolution", () => {
     );
   });
 
-  it("projects current runtime and context after a same-model harness change", async () => {
+  it("preserves a router-owned session's recorded model, runtime, and context window", async () => {
     setMockSessionsConfig(() => ({
       agents: {
         defaults: {
-          model: { primary: "openai/gpt-5.6-sol" },
+          model: { primary: "openai/gpt-5.6" },
           models: {
-            "openai/gpt-5.6-sol": { agentRuntime: { id: "codex" } },
+            "clawrouter/openai/gpt-5.6": { agentRuntime: { id: "openclaw" } },
+            "openai/gpt-5.6": { agentRuntime: { id: "codex" } },
+          },
+        },
+      },
+      models: {
+        providers: {
+          clawrouter: { models: [{ id: "openai/gpt-5.6", contextTokens: 272_000 }] },
+          openai: {
+            models: [{ id: "gpt-5.6", contextTokens: 1_000_000, contextWindow: 1_050_000 }],
+          },
+        },
+      },
+    }));
+    const sessionKey = "agent:main:main";
+    const sessionEntry = {
+      sessionId: "router-owned-session",
+      updatedAt: Date.now() - 60_000,
+      modelProvider: "clawrouter",
+      model: "openai/gpt-5.6",
+      agentHarnessId: "openclaw",
+      contextTokens: 272_000,
+      contextTokensSource: "runtime",
+    } satisfies SessionEntry;
+
+    await withSqliteStore(
+      "sessions-router-owned-runtime-context",
+      { [sessionKey]: sessionEntry },
+      async (store) => {
+        const databasePath = resolveSqliteTargetFromSessionStorePath(store, {
+          agentId: "main",
+        }).path;
+        const database = openOpenClawAgentDatabase({ agentId: "main", path: databasePath });
+        const db = getNodeSqliteKysely<
+          Pick<OpenClawAgentKyselyDatabase, "session_nodes" | "session_windows">
+        >(database.db);
+        const persisted = executeSqliteQueryTakeFirstSync(
+          database.db,
+          db
+            .selectFrom("session_windows")
+            .innerJoin("session_nodes", "session_nodes.session_key", "session_windows.session_key")
+            .select([
+              "session_windows.model_provider as modelProvider",
+              "session_windows.model as model",
+              "session_windows.agent_harness_id as agentHarnessId",
+              "session_nodes.session_key as sessionKey",
+              "session_nodes.current_session_id as sessionId",
+              "session_nodes.entry_json as entryJson",
+            ])
+            .where("session_windows.session_id", "=", sessionEntry.sessionId),
+        );
+
+        expect(persisted).toEqual({
+          modelProvider: "clawrouter",
+          model: "openai/gpt-5.6",
+          agentHarnessId: "openclaw",
+          sessionKey,
+          sessionId: sessionEntry.sessionId,
+          entryJson: expect.any(String),
+        });
+        expect(JSON.parse(persisted?.entryJson ?? "{}")).toMatchObject(sessionEntry);
+
+        const payload = await runSessionsJson<SessionsJsonPayload>(sessionsCommand, store);
+        const session = payload.sessions?.find((row) => row.key === sessionKey);
+
+        expect(session).toMatchObject({
+          modelProvider: "clawrouter",
+          model: "openai/gpt-5.6",
+          agentRuntime: { id: "openclaw", source: "session" },
+          contextTokens: 272_000,
+        });
+      },
+    );
+  });
+
+  it("preserves recorded runtime while projecting current context after a harness change", async () => {
+    setMockSessionsConfig(() => ({
+      agents: {
+        defaults: {
+          model: { primary: "openai/gpt-5.6-luna" },
+          models: {
+            "openai/gpt-5.6-luna": { agentRuntime: { id: "codex" } },
           },
         },
       },
       models: {
         providers: {
           openai: {
-            models: [{ id: "gpt-5.6-sol", contextTokens: 1_000_000, contextWindow: 1_050_000 }],
+            models: [{ id: "gpt-5.6-luna", contextTokens: 1_000_000, contextWindow: 1_050_000 }],
           },
         },
       },
@@ -227,7 +322,7 @@ describe("sessionsCommand model resolution", () => {
           sessionId: "stale-openclaw-window",
           updatedAt: Date.now() - 60_000,
           modelProvider: "openai",
-          model: "gpt-5.6-sol",
+          model: "gpt-5.6-luna",
           agentHarnessId: "openclaw",
           contextTokens: 272_000,
           contextTokensSource: "runtime",
@@ -237,7 +332,7 @@ describe("sessionsCommand model resolution", () => {
         const payload = await runSessionsJson<SessionsJsonPayload>(sessionsCommand, store);
         const session = payload.sessions?.find((row) => row.key === "agent:main:main");
 
-        expect(session?.agentRuntime).toEqual({ id: "codex", source: "model" });
+        expect(session?.agentRuntime).toEqual({ id: "openclaw", source: "session" });
         expect(session?.contextTokens).toBe(1_000_000);
       },
     );
@@ -247,15 +342,15 @@ describe("sessionsCommand model resolution", () => {
     setMockSessionsConfig(() => ({
       agents: {
         defaults: {
-          model: { primary: "openai/gpt-5.6-sol" },
+          model: { primary: "openai/gpt-5.6-luna" },
           models: {
-            "openai/gpt-5.6-sol": { agentRuntime: { id: "codex" } },
+            "openai/gpt-5.6-luna": { agentRuntime: { id: "codex" } },
           },
         },
       },
       models: {
         providers: {
-          openai: { models: [{ id: "gpt-5.6-sol", contextWindow: 1_000_000 }] },
+          openai: { models: [{ id: "gpt-5.6-luna", contextWindow: 1_000_000 }] },
         },
       },
     }));
@@ -266,7 +361,7 @@ describe("sessionsCommand model resolution", () => {
           sessionId: "matching-codex-window",
           updatedAt: Date.now() - 60_000,
           modelProvider: "openai",
-          model: "gpt-5.6-sol",
+          model: "gpt-5.6-luna",
           agentHarnessId: "codex",
           contextTokens: 272_000,
           contextTokensSource: "runtime",
@@ -318,15 +413,15 @@ describe("sessionsCommand model resolution", () => {
     setMockSessionsConfig(() => ({
       agents: {
         defaults: {
-          model: { primary: "openai/gpt-5.6-sol" },
+          model: { primary: "openai/gpt-5.6-luna" },
           models: {
-            "openai/gpt-5.6-sol": { agentRuntime: { id: "openclaw" } },
+            "openai/gpt-5.6-luna": { agentRuntime: { id: "openclaw" } },
           },
         },
       },
       models: {
         providers: {
-          openai: { models: [{ id: "gpt-5.6-sol", contextTokens: 272_000 }] },
+          openai: { models: [{ id: "gpt-5.6-luna", contextTokens: 272_000 }] },
         },
       },
     }));
@@ -337,7 +432,7 @@ describe("sessionsCommand model resolution", () => {
           sessionId: "locked-codex-window",
           updatedAt: Date.now() - 60_000,
           modelProvider: "openai",
-          model: "gpt-5.6-sol",
+          model: "gpt-5.6-luna",
           agentHarnessId: "codex",
           contextTokens: 1_000_000,
           modelSelectionLocked: true,

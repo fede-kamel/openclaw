@@ -43,6 +43,7 @@ describe("tool-catalog", () => {
   it("includes code execution, web tools, and progress_card in the coding profile policy", () => {
     const policy = requireCoreToolProfilePolicy("coding");
     expect(policy.allow).toEqual([
+      "ls",
       "read",
       "write",
       "edit",
@@ -50,6 +51,7 @@ describe("tool-catalog", () => {
       "exec",
       "process",
       "code_execution",
+      "secrets",
       "web_search",
       "web_fetch",
       "x_search",
@@ -77,6 +79,8 @@ describe("tool-catalog", () => {
       "terminal",
       "portal",
       "automations",
+      "gateway",
+      "plugins",
       "get_goal",
       "create_goal",
       "update_goal",
@@ -94,6 +98,7 @@ describe("tool-catalog", () => {
   it("includes bundle MCP tools in coding and messaging profile policies", () => {
     expect(requirePolicyAllow("coding").at(-1)).toBe("bundle-mcp");
     expect(requirePolicyAllow("messaging")).toEqual([
+      "secrets",
       "sessions",
       "sessions_list",
       "sessions_history",
@@ -107,10 +112,19 @@ describe("tool-catalog", () => {
       "subagents",
       "session_status",
       "message",
+      "gateway",
       "ask_user",
       "bundle-mcp",
     ]);
-    expect(requirePolicyAllow("minimal")).toEqual(["session_status"]);
+    expect(requirePolicyAllow("minimal")).toEqual(["session_status", "gateway"]);
+  });
+
+  it("treats pdf as a known media core tool, not a plugin id", () => {
+    const mediaIds = listCoreToolSections()
+      .find((section) => section.id === "media")
+      ?.tools.map((tool) => tool.id);
+    expect(mediaIds).toContain("pdf");
+    expect(mediaIds).toContain("tts");
   });
 
   it("full profile uses wildcard to grant all tools (#76507)", () => {

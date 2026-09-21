@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Bash 5.3+ can deadlock writing heredoc pipes on macOS before the reader starts.
+if [[ ${OSTYPE:-} == darwin* && $BASH != /bin/bash ]] && ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3))); then
+  exec /bin/bash "$0" "$@"
+fi
 set -euo pipefail
 
 gh_with_retry() {
@@ -63,11 +67,14 @@ if [[ "$normalized_context_ref" =~ ^release/([0-9]{4}\.[0-9]+\.[0-9]+)$ ]]; then
     echo "Telegram candidate version ${candidate_version} does not belong to release ${release_version}." >&2
     exit 1
   fi
-elif [[ "$normalized_context_ref" =~ ^extended-stable/([0-9]{4}\.[0-9]+\.33)$ ]]; then
+elif [[ "$normalized_context_ref" =~ ^extended-stable/([0-9]{4}\.([1-9]|1[0-2])\.33)$ ]]; then
   context_version="${BASH_REMATCH[1]}"
+  context_line="${context_version%.33}"
   candidate_version="$(jq -er '.version' "${candidate_root}/package.json")"
-  if [[ "$candidate_version" != "$context_version" ]]; then
-    echo "Telegram candidate version ${candidate_version} does not match context ${normalized_context_ref}." >&2
+  if [[ ! "$candidate_version" =~ ^([0-9]{4}\.([1-9]|1[0-2]))\.([1-9][0-9]*)$ ]] ||
+     [[ "${BASH_REMATCH[1]}" != "$context_line" ]] ||
+     (( 10#${BASH_REMATCH[3]} < 33 )); then
+    echo "Telegram candidate version ${candidate_version} does not belong to context ${normalized_context_ref}; expected a final ${context_line}.PATCH version with PATCH >= 33." >&2
     exit 1
   fi
   context_release_branch="$normalized_context_ref"
@@ -87,7 +94,7 @@ candidate_metadata_json="$(
   # GraphQL expands these variables server-side, not in the shell.
   # shellcheck disable=SC2016
   gh_with_retry api graphql \
-    -f query='query($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{oid signature{isValid state signer{login}} associatedPullRequests(first:100){nodes{state headRefOid headRepository{nameWithOwner} baseRefName baseRepository{nameWithOwner} mergeCommit{oid} mergedBy{login}}}}}}}' \
+    -f query='query($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{oid messageHeadline signature{isValid state signer{login}} associatedPullRequests(first:100){nodes{state headRefOid headRepository{nameWithOwner} baseRefName baseRepository{nameWithOwner} mergeCommit{oid} mergedBy{login}}}}}}}' \
     -f owner="$repository_owner" \
     -f name="$repository_name" \
     -f oid="$candidate_sha"
@@ -228,14 +235,34 @@ if [[ "$trusted_reason" != "main-ancestor" ]]; then
       echo "Unsigned or GitHub web-flow candidates require an exact release branch head." >&2
       exit 1
     fi
+    merge_pr_candidates="$(jq -c '.data.repository.object.associatedPullRequests.nodes' <<<"$candidate_metadata_json")"
+    if [[ "$(jq 'length' <<<"$merge_pr_candidates")" == "0" ]]; then
+      # GitHub can omit a squash merge from its commit-to-PR association index.
+      # The subject supplies only a lookup hint: the direct PR record must still
+      # satisfy the exact merge/repository checks below and live actor permission.
+      candidate_subject="$(jq -r '.data.repository.object.messageHeadline // ""' <<<"$candidate_metadata_json")"
+      merge_pr_hint_pattern='\(#([1-9][0-9]*)\)$'
+      if [[ "$candidate_subject" =~ $merge_pr_hint_pattern ]]; then
+        merge_pr_number="${BASH_REMATCH[1]}"
+        direct_pr_json="$(
+          # shellcheck disable=SC2016
+          gh_with_retry api graphql \
+            -f query='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){state baseRepository{nameWithOwner} mergeCommit{oid} mergedBy{login}}}}' \
+            -f owner="$repository_owner" \
+            -f name="$repository_name" \
+            -F number="$merge_pr_number"
+        )"
+        merge_pr_candidates="$(jq -c '[.data.repository.pullRequest | select(. != null)]' <<<"$direct_pr_json")"
+      fi
+    fi
     matching_merge_prs="$(
       jq -c \
         --arg repo "$GITHUB_REPOSITORY" \
         --arg sha "$candidate_sha" \
-        '[.data.repository.object.associatedPullRequests.nodes[] |
+        '[.[] |
           select(.state == "MERGED" and .baseRepository.nameWithOwner == $repo and
             .mergeCommit.oid == $sha)]' \
-        <<<"$candidate_metadata_json"
+        <<<"$merge_pr_candidates"
     )"
     if [[ "$(jq 'length' <<<"$matching_merge_prs")" != "1" ]]; then
       echo "Unsigned or GitHub web-flow candidate ${candidate_sha} requires one exact merged same-repository PR." >&2

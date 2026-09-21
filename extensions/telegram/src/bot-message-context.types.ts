@@ -24,8 +24,10 @@ export type TelegramMediaRef = {
   kind: TelegramMediaKind;
   path?: string;
   contentType?: string;
+  fileName?: string;
   stickerMetadata?: StickerMetadata;
   sourceMessageId?: string;
+  unavailable?: { reason: "oversize"; limitMb: number } | { reason: "download-failed" };
 };
 
 export type TelegramChannelIngressResolver = (
@@ -72,10 +74,8 @@ type ResolveTelegramGroupConfig = (
 };
 
 type ResolveGroupActivation = (params: {
-  chatId: string | number;
   agentId?: string;
-  messageThreadId?: number;
-  sessionKey?: string;
+  sessionKey: string;
   cfg: OpenClawConfig;
 }) => boolean | undefined;
 
@@ -103,6 +103,7 @@ export type TelegramMessageContextSessionRuntimeOverrides = Partial<
 >;
 
 export type BuildTelegramMessageContextParams = {
+  nativeCommandNames?: ReadonlyMap<string, string>;
   primaryCtx: TelegramContext;
   allMedia: TelegramMediaRef[];
   replyMedia?: TelegramMediaRef[];

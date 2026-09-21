@@ -1,10 +1,19 @@
 // Skills CLI command tests cover skill command registration and subcommand behavior.
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { GatewayClientRequestError } from "../../packages/gateway-client/src/request-error.js";
 import {
   AgentSelectionRequiredError,
+  resolveConfiguredAgentId,
   type AgentSelectionContext,
 } from "../agents/agent-scope-config.js";
+import { GatewayTransportError } from "../gateway/transport-error.js";
+import type { SkillStatusReport } from "../skills/discovery/status.js";
+import {
+  expectObjectFields,
+  mockCall,
+  mockFirstObjectArg,
+} from "../test-utils/mock-call-assertions.js";
 import { registerSkillsCli } from "./skills-cli.js";
 
 const ORIGINAL_STDIN_TTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
@@ -33,7 +42,7 @@ const mocks = vi.hoisted(() => {
   const runtimeStdout: string[] = [];
   const runtimeErrors: string[] = [];
   const stringifyArgs = (args: unknown[]) => args.map((value) => String(value)).join(" ");
-  const skillStatusReportFixture = {
+  const skillStatusReportFixture: SkillStatusReport = {
     workspaceDir: "/tmp/workspace",
     managedSkillsDir: "/tmp/workspace/skills",
     skills: [
@@ -50,7 +59,12 @@ const mocks = vi.hoisted(() => {
         always: false,
         disabled: false,
         blockedByAllowlist: false,
+        blockedByAgentFilter: false,
         eligible: true,
+        platformIncompatible: false,
+        modelVisible: true,
+        userInvocable: true,
+        commandVisible: true,
         primaryEnv: "CALENDAR_API_KEY",
         requirements: {
           bins: [],
@@ -105,6 +119,9 @@ const mocks = vi.hoisted(() => {
     resolveAgentIdByWorkspacePathMock: vi.fn(
       (_configForTest: unknown, _workspacePath: string): string | undefined => undefined,
     ),
+    resolveConfiguredAgentIdMock: vi.fn(
+      (_configForTest: unknown, agentId: string): string => agentId,
+    ),
     resolveAgentWorkspaceDirMock: vi.fn(
       (_configForTest: unknown, _agentId: string) => "/tmp/workspace",
     ),
@@ -134,6 +151,7 @@ const {
   loadConfigMock,
   resolveDefaultAgentIdMock,
   resolveAgentIdByWorkspacePathMock,
+  resolveConfiguredAgentIdMock,
   resolveAgentWorkspaceDirMock,
   searchSkillsFromClawHubMock,
   installSkillFromClawHubMock,
@@ -181,33 +199,6 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-function mockCall(mock: unknown, index = 0): Array<unknown> {
-  const calls = (mock as { mock?: { calls?: Array<Array<unknown>> } }).mock?.calls ?? [];
-  const call = calls.at(index);
-  if (!call) {
-    throw new Error(`Expected mock call ${index + 1}`);
-  }
-  return call;
-}
-
-function mockFirstObjectArg(mock: unknown): Record<string, unknown> {
-  const [arg] = mockCall(mock);
-  if (!arg || typeof arg !== "object") {
-    throw new Error("expected first mock argument object");
-  }
-  return arg as Record<string, unknown>;
-}
-
-function expectObjectFields(value: unknown, expected: Record<string, unknown>): void {
-  if (!value || typeof value !== "object") {
-    throw new Error("expected object fields");
-  }
-  const record = value as Record<string, unknown>;
-  for (const [key, expectedValue] of Object.entries(expected)) {
-    expect(record[key], key).toEqual(expectedValue);
-  }
-}
-
 function expectLogger(value: unknown): void {
   if (!value || typeof value !== "object") {
     throw new Error("expected logger object");
@@ -251,12 +242,24 @@ function primeCalendarUpdate(workspaceDir = "/tmp/workspace"): void {
   ]);
 }
 
-vi.mock("../runtime.js", () => ({
+vi.mock("../runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../runtime.js")>()),
   defaultRuntime: mocks.defaultRuntime,
+}));
+
+vi.mock("./one-shot-exit.js", () => ({
+  exitCliAfterOutput: (runtime: typeof mocks.defaultRuntime, exitCode: number) =>
+    runtime.exit(exitCode),
 }));
 
 vi.mock("../gateway/call.js", () => ({
   callGateway: (...args: unknown[]) => mocks.callGatewayMock(...args),
+  isGatewayClientRequestError: (error: unknown) =>
+    error instanceof Error && error.name === "GatewayClientRequestError",
+  isGatewayCredentialsRequiredError: (error: unknown) =>
+    error instanceof Error && error.name === "GatewayCredentialsRequiredError",
+  isImplicitLocalGatewayTarget: async ({ config }: { config?: { gateway?: { mode?: string } } }) =>
+    !process.env.OPENCLAW_GATEWAY_URL && config?.gateway?.mode !== "remote",
 }));
 
 vi.mock("../utils.js", async (importOriginal) => ({
@@ -272,6 +275,8 @@ vi.mock("../config/config.js", () => ({
 vi.mock("../agents/agent-scope.js", () => ({
   resolveAgentIdByWorkspacePath: (config: unknown, workspacePath: string) =>
     mocks.resolveAgentIdByWorkspacePathMock(config, workspacePath),
+  resolveConfiguredAgentId: (config: unknown, agentId: string) =>
+    mocks.resolveConfiguredAgentIdMock(config, agentId),
   resolveDefaultAgentId: (config: unknown, context?: AgentSelectionContext) =>
     mocks.resolveDefaultAgentIdMock(config, context),
   resolveAgentWorkspaceDir: (config: unknown, agentId: string) =>
@@ -347,6 +352,7 @@ describe("skills cli commands", () => {
     loadConfigMock.mockReset();
     resolveDefaultAgentIdMock.mockReset();
     resolveAgentIdByWorkspacePathMock.mockReset();
+    resolveConfiguredAgentIdMock.mockReset();
     resolveAgentWorkspaceDirMock.mockReset();
     searchSkillsFromClawHubMock.mockReset();
     installSkillFromClawHubMock.mockReset();
@@ -362,10 +368,23 @@ describe("skills cli commands", () => {
     fetchClawHubSkillCardMock.mockReset();
     buildWorkspaceSkillStatusMock.mockReset();
 
-    callGatewayMock.mockRejectedValue(new Error("gateway unavailable"));
+    callGatewayMock.mockRejectedValue(
+      new GatewayTransportError({
+        kind: "closed",
+        code: 1006,
+        reason: "abnormal closure",
+        message: "gateway closed (1006): abnormal closure",
+        connectionDetails: {
+          url: "ws://127.0.0.1:18789",
+          urlSource: "local loopback",
+          message: "",
+        },
+      }),
+    );
     loadConfigMock.mockReturnValue({});
     resolveDefaultAgentIdMock.mockReturnValue("main");
     resolveAgentIdByWorkspacePathMock.mockReturnValue(undefined);
+    resolveConfiguredAgentIdMock.mockImplementation((_config, agentId: string) => agentId);
     resolveAgentWorkspaceDirMock.mockReturnValue("/tmp/workspace");
     searchSkillsFromClawHubMock.mockResolvedValue([]);
     installSkillFromClawHubMock.mockResolvedValue({
@@ -709,6 +728,17 @@ describe("skills cli commands", () => {
     );
   });
 
+  it("passes a generic install confirmation to interactive ClawHub skill installs", async () => {
+    setTty(true);
+    primeCalendarInstall();
+
+    await runCommand(["skills", "install", "calendar"]);
+
+    expect(mockFirstObjectArg(installSkillFromClawHubMock).confirmInstall).toEqual(
+      expect.any(Function),
+    );
+  });
+
   it("passes noninteractive install-policy acknowledgement to skill installs", async () => {
     setTty(false);
     installSkillFromSourceMock.mockResolvedValue({
@@ -803,6 +833,17 @@ describe("skills cli commands", () => {
     expect(installSkillFromSourceMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { spec: "git:owner/tools", flag: "--force-install" },
+    { spec: "./local-skill", flag: "--force-install" },
+  ])("rejects ClawHub-only $flag for source install $spec", async ({ spec, flag }) => {
+    await expect(runCommand(["skills", "install", spec, flag])).rejects.toThrow("__exit__:1");
+
+    expect(runtimeErrors).toContain(`${flag} is only supported for ClawHub skill installs.`);
+    expect(installSkillFromClawHubMock).not.toHaveBeenCalled();
+    expect(installSkillFromSourceMock).not.toHaveBeenCalled();
+  });
+
   it("installs a skill into the cwd-inferred agent workspace", async () => {
     routeWorkspaceByAgent();
     resolveAgentIdByWorkspacePathMock.mockReturnValue("writer");
@@ -864,38 +905,22 @@ describe("skills cli commands", () => {
     );
   });
 
-  it.each([
-    { flag: "--force-install", option: "forceInstall" },
-    { flag: "--acknowledge-clawhub-risk", option: "acknowledgeClawHubRisk" },
-  ])("passes $flag through for ClawHub skill installs", async ({ flag, option }) => {
-    primeCalendarInstall();
+  it.each([{ flag: "--force-install", option: "forceInstall" }])(
+    "passes $flag through for ClawHub skill installs",
+    async ({ flag, option }) => {
+      primeCalendarInstall();
 
-    await runCommand(["skills", "install", "calendar", flag]);
+      await runCommand(["skills", "install", "calendar", flag]);
 
-    expect(installSkillFromClawHubMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workspaceDir: "/tmp/workspace",
-        slug: "calendar",
-        [option]: true,
-      }),
-    );
-  });
-
-  it("prints acknowledgement guidance for unacknowledged ClawHub skill installs", async () => {
-    installSkillFromClawHubMock.mockResolvedValue({
-      ok: false,
-      code: "clawhub_risk_acknowledgement_required",
-      error:
-        "Install cancelled; rerun with --acknowledge-clawhub-risk to continue after reviewing the warning.",
-      warning: "WARNING - ClawHub found security risks in this release",
-    });
-
-    await expect(runCommand(["skills", "install", "calendar"])).rejects.toThrow("__exit__:1");
-
-    expect(runtimeErrors).toContain(
-      "Install cancelled; rerun with --acknowledge-clawhub-risk to continue after reviewing the warning.",
-    );
-  });
+      expect(installSkillFromClawHubMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workspaceDir: "/tmp/workspace",
+          slug: "calendar",
+          [option]: true,
+        }),
+      );
+    },
+  );
 
   it("prints blocked ClawHub skill install failures when no trust warning was emitted", async () => {
     installSkillFromClawHubMock.mockResolvedValue({
@@ -966,8 +991,8 @@ describe("skills cli commands", () => {
   });
 
   it.each([
+    { flag: "--force", option: "force" },
     { flag: "--force-install", option: "forceInstall" },
-    { flag: "--acknowledge-clawhub-risk", option: "acknowledgeClawHubRisk" },
   ])("passes $flag through for ClawHub skill updates", async ({ flag, option }) => {
     primeCalendarUpdate();
 
@@ -982,22 +1007,21 @@ describe("skills cli commands", () => {
     );
   });
 
-  it("prints acknowledgement guidance for unacknowledged ClawHub skill updates", async () => {
+  it("prints --force retry guidance for blocked ClawHub skill updates", async () => {
     readTrackedClawHubSkillSlugsMock.mockResolvedValue(["calendar"]);
     updateSkillsFromClawHubMock.mockResolvedValue([
       {
         ok: false,
-        code: "clawhub_risk_acknowledgement_required",
+        code: "force_required",
         error:
-          "Update cancelled; rerun with --acknowledge-clawhub-risk to continue after reviewing the warning.",
-        warning: "WARNING - ClawHub found security risks in this release",
+          'Skill "calendar" has local file changes. Updating replaces the installed skill directory.',
       },
     ]);
 
     await expect(runCommand(["skills", "update", "calendar"])).rejects.toThrow("__exit__:1");
 
     expect(runtimeErrors).toContain(
-      "Update cancelled; rerun with --acknowledge-clawhub-risk to continue after reviewing the warning.",
+      'Skill "calendar" has local file changes. Updating replaces the installed skill directory. Re-run with --force to update it anyway.',
     );
   });
 
@@ -1477,6 +1501,81 @@ describe("skills cli commands", () => {
     expect(defaultRuntime.exit).toHaveBeenCalledWith(1);
   });
 
+  it.each([
+    ["weather", "skills.entries.weather.apiKey"],
+    ["acme.weather", `'skills.entries["acme.weather"].apiKey'`],
+    ["weather[home]", `'skills.entries["weather[home]"].apiKey'`],
+    ["123", `'skills.entries["123"].apiKey'`],
+  ])("skills info prints a copyable API-key setup path for %s", async (skillKey, path) => {
+    vi.stubEnv("OPENCLAW_PROFILE", "");
+    vi.stubEnv("OPENCLAW_CONTAINER_HINT", "");
+    buildWorkspaceSkillStatusMock.mockReturnValue({
+      ...skillStatusReportFixture,
+      skills: skillStatusReportFixture.skills.map((skill) => ({
+        ...skill,
+        skillKey,
+        eligible: false,
+        modelVisible: false,
+        commandVisible: false,
+        missing: { ...skill.missing, env: ["CALENDAR_API_KEY"] },
+      })),
+    });
+
+    await runCommand(["skills", "info", "calendar"]);
+
+    expect(runtimeStdout).toHaveLength(1);
+    expect(runtimeStdout[0]).toContain(`Save via CLI: openclaw config set ${path} YOUR_KEY`);
+  });
+
+  it.each([true, false])(
+    "skills info renders one status per alternative group (satisfied: %s)",
+    async (satisfied) => {
+      const anyBins = ["node", "openclaw-definitely-missing-runtime"];
+      const os = ["linux", "darwin"];
+      const report: SkillStatusReport = {
+        ...skillStatusReportFixture,
+        skills: skillStatusReportFixture.skills.map((skill) => ({
+          ...skill,
+          eligible: false,
+          modelVisible: false,
+          commandVisible: false,
+          platformIncompatible: !satisfied,
+          requirements: {
+            bins: ["present-bin", "missing-bin"],
+            anyBins,
+            env: ["PRESENT_ENV", "MISSING_ENV"],
+            config: ["present.config", "missing.config"],
+            os,
+          },
+          missing: {
+            bins: ["missing-bin"],
+            anyBins: satisfied ? [] : anyBins,
+            env: ["MISSING_ENV"],
+            config: ["missing.config"],
+            os: satisfied ? [] : os,
+          },
+        })),
+      };
+      buildWorkspaceSkillStatusMock.mockReturnValue(report);
+
+      await runCommand(["skills", "info", "calendar"]);
+
+      const mark = satisfied ? "✓" : "✗";
+      expect(runtimeStdout).toHaveLength(1);
+      expect(runtimeStdout[0]).toContain(
+        `Any binaries: ${mark} (any of: node, openclaw-definitely-missing-runtime)`,
+      );
+      expect(runtimeStdout[0]).toContain(`OS: ${mark} (linux, darwin)`);
+      expect(runtimeStdout[0]).toContain("Binaries: ✓ present-bin, ✗ missing-bin");
+      expect(runtimeStdout[0]).toContain("Environment: ✓ PRESENT_ENV, ✗ MISSING_ENV");
+      expect(runtimeStdout[0]).toContain("Config: ✓ present.config, ✗ missing.config");
+
+      await runCommand(["skills", "info", "calendar", "--json"]);
+
+      expect(runtimeStdout[1]).toBe(JSON.stringify(report.skills[0], null, 2));
+    },
+  );
+
   it("keeps successful human skill info output at exit zero", async () => {
     await runCommand(["skills", "info", "calendar"]);
 
@@ -1499,6 +1598,7 @@ describe("skills cli commands", () => {
       await runCommand(argv);
     });
 
+    expect(resolveConfiguredAgentIdMock).not.toHaveBeenCalled();
     expectStatusWorkspaceCall("/tmp/workspace-writer");
   });
 
@@ -1556,6 +1656,177 @@ describe("skills cli commands", () => {
     expect(output.missingRequirements).toEqual([]);
   });
 
+  const explicitGatewaySkillFailures = [
+    {
+      label: "configured remote missing URL",
+      config: { gateway: { mode: "remote" as const } },
+      message: "gateway remote mode misconfigured: gateway.remote.url missing",
+    },
+    {
+      label: "configured remote transport failure",
+      config: { gateway: { mode: "remote" as const, remote: { url: "ws://127.0.0.1:9" } } },
+      message: "Gateway not reachable: ws://127.0.0.1:9",
+    },
+    {
+      label: "configured remote auth failure",
+      config: { gateway: { mode: "remote" as const, remote: { url: "ws://127.0.0.1:9" } } },
+      message: "gateway authentication failed",
+    },
+    {
+      label: "environment-selected transport failure",
+      config: {},
+      url: "ws://127.0.0.1:9",
+      message: "Gateway not reachable: ws://127.0.0.1:9",
+    },
+    {
+      label: "environment-selected auth failure",
+      config: {},
+      url: "ws://127.0.0.1:9",
+      message: "gateway authentication failed",
+    },
+  ];
+  const skillReadCommands = [
+    { label: "default", argv: ["skills"] },
+    { label: "list", argv: ["skills", "list"] },
+    { label: "info", argv: ["skills", "info", "calendar"] },
+    { label: "check", argv: ["skills", "check"] },
+  ];
+
+  it.each(
+    explicitGatewaySkillFailures.flatMap((target) =>
+      skillReadCommands.flatMap((command) =>
+        [false, true].map((json) => ({
+          target,
+          command,
+          json,
+          label: `${command.label} ${json ? "JSON" : "human"}: ${target.label}`,
+        })),
+      ),
+    ),
+  )("does not substitute local skills after $label", async ({ target, command, json }) => {
+    loadConfigMock.mockReturnValue(target.config);
+    if (target.url) {
+      vi.stubEnv("OPENCLAW_GATEWAY_URL", target.url);
+    }
+    callGatewayMock.mockRejectedValue(new Error(target.message));
+
+    await expect(runCommand([...command.argv, ...(json ? ["--json"] : [])])).rejects.toThrow(
+      "__exit__:1",
+    );
+
+    expect(runtimeErrors).toEqual([target.message]);
+    expect(runtimeStdout).toEqual([]);
+    expect(buildWorkspaceSkillStatusMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "request validation",
+      outcome: "command",
+      error: new GatewayClientRequestError({
+        code: "INVALID_REQUEST",
+        message: 'invalid skills.status params: unknown agent id "retired"',
+      }),
+    },
+    {
+      label: "internal server failure",
+      outcome: "command",
+      error: new GatewayClientRequestError({
+        code: "INTERNAL_ERROR",
+        message: "inventory crashed",
+      }),
+    },
+    {
+      label: "authentication close",
+      outcome: "root",
+      error: new GatewayTransportError({
+        kind: "closed",
+        code: 1008,
+        reason: "pairing required",
+        message: "gateway closed (1008): pairing required",
+        connectionDetails: {
+          url: "ws://127.0.0.1:18789",
+          urlSource: "local loopback",
+          message: "",
+        },
+      }),
+    },
+    {
+      label: "plain pairing close",
+      outcome: "command",
+      error: new Error("gateway closed (1008): pairing required"),
+    },
+    { label: "unknown failure", outcome: "command", error: new Error("gateway unavailable") },
+  ])("does not substitute implicit-local skills after $label", async ({ error, outcome }) => {
+    callGatewayMock.mockRejectedValue(error);
+
+    // Root-owned credential/transport errors propagate; ordinary command errors log and exit.
+    const command = runCommand(["skills", "list", "--json"]);
+    if (outcome === "root") {
+      await expect(command).rejects.toBe(error);
+      expect(runtimeErrors).toEqual([]);
+    } else {
+      await expect(command).rejects.toThrow("__exit__:1");
+      expect(runtimeErrors).toEqual([error.message]);
+    }
+    expect(runtimeStdout).toEqual([]);
+    expect(buildWorkspaceSkillStatusMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "missing credentials before connecting",
+      error: Object.assign(new Error("gateway requires credentials"), {
+        name: "GatewayCredentialsRequiredError",
+        method: "skills.status",
+        configPath: "/tmp/openclaw.json",
+      }),
+    },
+    {
+      label: "typed timeout",
+      error: new GatewayTransportError({
+        kind: "timeout",
+        timeoutMs: 1_500,
+        message: "gateway timeout after 1500ms",
+        connectionDetails: {
+          url: "ws://127.0.0.1:18789",
+          urlSource: "local loopback",
+          message: "",
+        },
+      }),
+    },
+    { label: "pending-request close", error: new Error("gateway closed (1006): abnormal closure") },
+    { label: "pending-request timeout", error: new Error("gateway timeout after 1500ms") },
+    {
+      label: "older unknown method",
+      error: new GatewayClientRequestError({
+        code: "INVALID_REQUEST",
+        message: "unknown method: skills.status",
+      }),
+    },
+    {
+      label: "older unsupported agent selector",
+      error: new GatewayClientRequestError({
+        code: "INVALID_REQUEST",
+        message: "invalid skills.status params: unexpected property agentId",
+      }),
+    },
+    {
+      label: "older standard agent-selector validation",
+      error: new GatewayClientRequestError({
+        code: "INVALID_REQUEST",
+        message: "invalid skills.status params: at root: unexpected property 'agentId'",
+      }),
+    },
+  ])("retains implicit-local skills recovery after $label", async ({ error }) => {
+    callGatewayMock.mockRejectedValue(error);
+
+    await runCommand(["skills", "list", "--json"]);
+
+    expect(buildWorkspaceSkillStatusMock).toHaveBeenCalledOnce();
+    expect(runtimeErrors).toEqual([]);
+  });
+
   it.each([
     ["list", ["skills", "list", "--agent", "writer", "--json"]],
     ["info", ["skills", "info", "calendar", "--agent", "writer", "--json"]],
@@ -1570,7 +1841,57 @@ describe("skills cli commands", () => {
     });
 
     expect(resolveAgentIdByWorkspacePathMock).not.toHaveBeenCalled();
+    expect(resolveConfiguredAgentIdMock).toHaveBeenCalledWith({}, "writer");
     expectStatusWorkspaceCall("/tmp/workspace-writer");
+  });
+
+  it.each([
+    ["list", ["skills", "list", "--agent", "nope-agent"]],
+    ["check", ["skills", "check", "--agent", "nope-agent"]],
+    ["default parent option", ["skills", "--agent", "nope-agent"]],
+    ["install", ["skills", "install", "calendar", "--agent", "nope-agent"]],
+    ["verify", ["skills", "verify", "calendar", "--card", "--agent", "nope-agent"]],
+    ["workshop list", ["skills", "workshop", "list", "--agent", "nope-agent"]],
+    ["workshop inspect", ["skills", "workshop", "inspect", "proposal-id", "--agent", "nope-agent"]],
+    [
+      "workshop proposal",
+      [
+        "skills",
+        "workshop",
+        "propose-create",
+        "--name",
+        "calendar-helper",
+        "--description",
+        "Calendar helper",
+        "--proposal",
+        "/missing/proposal.md",
+        "--agent",
+        "nope-agent",
+      ],
+    ],
+  ])("rejects an unknown agent before skills %s work", async (_label, argv) => {
+    resolveConfiguredAgentIdMock.mockImplementation((_config, agentId: string) =>
+      resolveConfiguredAgentId({ agents: { list: [{ id: "main" }, { id: "writer" }] } }, agentId),
+    );
+
+    await expect(runCommand(argv)).rejects.toThrow("__exit__:1");
+
+    expect(runtimeErrors).toStrictEqual([
+      'Unknown agent id "nope-agent". Run openclaw agents list to see configured agents.',
+    ]);
+    expect(resolveAgentWorkspaceDirMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["empty", ["skills", "check", "--agent", ""]],
+    ["whitespace-only", ["skills", "check", "--agent", "   "]],
+    ["empty with --global", ["skills", "install", "calendar", "--global", "--agent", ""]],
+  ])("rejects a blank explicit skills agent (%s)", async (_label, argv) => {
+    await expect(runCommand(argv)).rejects.toThrow("__exit__:1");
+
+    expect(runtimeErrors).toStrictEqual(["--agent must not be blank"]);
+    expect(resolveConfiguredAgentIdMock).not.toHaveBeenCalled();
+    expect(resolveAgentWorkspaceDirMock).not.toHaveBeenCalled();
   });
 
   it("falls back to the default agent outside configured workspaces", async () => {
@@ -1587,20 +1908,25 @@ describe("skills cli commands", () => {
       {},
       expect.objectContaining({ hint: "Pass --agent <id>." }),
     );
+    expect(resolveConfiguredAgentIdMock).not.toHaveBeenCalled();
     expectStatusWorkspaceCall("/tmp/workspace-main");
   });
 
-  it("renders the supported skills escape without advertising --all-agents", async () => {
+  it("hands the supported skills escape to the CLI failure owner without --all-agents", async () => {
     resolveDefaultAgentIdMock.mockImplementationOnce((_config, context) => {
       throw new AgentSelectionRequiredError(["main", "helper", "third"], context);
     });
 
-    await expect(runCommand(["skills", "list"])).rejects.toThrow("__exit__:1");
-
-    expect(runtimeErrors).toStrictEqual([
-      "Multiple agents are configured, but the skills command has no explicit owner. Pass --agent <id>.",
-    ]);
-    expect(runtimeErrors[0]).not.toContain("--all-agents");
+    // Agent selection is an expected CLI condition; the root failure owner renders it
+    // without crash framing, so the command must not print a second copy.
+    await expect(runCommand(["skills", "list"])).rejects.toThrow(
+      expect.objectContaining({
+        name: "AgentSelectionRequiredError",
+        message:
+          "Multiple agents are configured, but the skills command has no explicit owner. Pass --agent <id>.",
+      }),
+    );
+    expect(runtimeErrors).toStrictEqual([]);
   });
 
   it("redacts secrets from rendered skills CLI errors", async () => {

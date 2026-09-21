@@ -1,11 +1,20 @@
 import path from "node:path";
-import { readStringValue } from "@openclaw/normalization-core/string-coerce";
+import { normalizeAgentId } from "@openclaw/normalization-core/agent-id";
 import {
   isArchivePathWithin,
   normalizeArchivePath,
   normalizeArchiveRoot,
+  type BackupSymbolicLink,
 } from "../infra/backup-archive-path-policy.js";
+import { normalizeWindowsPathForComparison } from "../infra/path-guards.js";
 import { isRecord } from "../utils.js";
+
+export function backupManifestSizeError(bytes: number): Error | undefined {
+  const maxBytes = 1024 * 1024;
+  return bytes > maxBytes
+    ? new Error(`Backup manifest exceeds ${maxBytes} byte limit.`)
+    : undefined;
+}
 
 export type BackupManifest = {
   schemaVersion: number;
@@ -16,18 +25,21 @@ export type BackupManifest = {
   nodeVersion: string;
   options?: {
     includeWorkspace?: boolean;
+    onlyConfig?: boolean;
   };
   paths?: {
     stateDir?: string;
     configPath?: string;
     oauthDir?: string;
     workspaceDirs?: string[];
+    agentRoots?: Array<{ agentId: string; sourcePath: string }>;
   };
   assets: Array<{
     kind: string;
     sourcePath: string;
     archivePath: string;
   }>;
+  externalSymbolicLinks?: BackupSymbolicLink[];
   skipped?: Array<{
     kind?: string;
     sourcePath?: string;
@@ -35,6 +47,59 @@ export type BackupManifest = {
     coveredBy?: string;
   }>;
 };
+
+function parseBackupManifestSourcePath(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new Error(`Backup manifest ${label} has an invalid sourcePath.`);
+  }
+  const windowsPath = /^(?:[A-Za-z]:[\\/]|\\\\(?![?.]\\))/u.test(value);
+  const normalized = windowsPath ? path.win32.normalize(value) : path.posix.normalize(value);
+  if ((!windowsPath && !value.startsWith("/")) || normalized !== value) {
+    throw new Error(`Backup manifest ${label} sourcePath must be absolute and normalized.`);
+  }
+  return value;
+}
+
+function parseBackupManifestAgentRoots(
+  value: unknown,
+): Array<{ agentId: string; sourcePath: string }> | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("Backup manifest agentRoots must be an array.");
+  }
+
+  const agentRoots: Array<{ agentId: string; sourcePath: string }> = [];
+  const seenAgentIds = new Set<string>();
+  const seenSourcePaths = new Set<string>();
+  for (const agentRoot of value) {
+    if (
+      !isRecord(agentRoot) ||
+      Object.keys(agentRoot).length !== 2 ||
+      !Object.hasOwn(agentRoot, "agentId") ||
+      !Object.hasOwn(agentRoot, "sourcePath")
+    ) {
+      throw new Error("Backup manifest agent root must contain only agentId and sourcePath.");
+    }
+    const { agentId, sourcePath } = agentRoot;
+    if (typeof agentId !== "string" || !agentId || normalizeAgentId(agentId) !== agentId) {
+      throw new Error("Backup manifest agent root has an invalid or noncanonical agentId.");
+    }
+    const normalizedSourcePath = parseBackupManifestSourcePath(sourcePath, "agent root");
+    const windowsPath = /^(?:[A-Za-z]:[\\/]|\\\\(?![?.]\\))/u.test(normalizedSourcePath);
+    const sourcePathKey = windowsPath
+      ? normalizeWindowsPathForComparison(normalizedSourcePath)
+      : normalizedSourcePath;
+    if (seenAgentIds.has(agentId) || seenSourcePaths.has(sourcePathKey)) {
+      throw new Error("Backup manifest contains duplicate agent root ownership.");
+    }
+    seenAgentIds.add(agentId);
+    seenSourcePaths.add(sourcePathKey);
+    agentRoots.push({ agentId, sourcePath: normalizedSourcePath });
+  }
+  return agentRoots;
+}
 
 export function parseBackupManifest(raw: string): BackupManifest {
   let parsed: unknown;
@@ -81,6 +146,23 @@ export function parseBackupManifest(raw: string): BackupManifest {
     });
   }
 
+  const externalSymbolicLinks: BackupSymbolicLink[] = [];
+  if (parsed.externalSymbolicLinks !== undefined) {
+    if (!Array.isArray(parsed.externalSymbolicLinks)) {
+      throw new Error("Backup manifest externalSymbolicLinks must be an array.");
+    }
+    for (const link of parsed.externalSymbolicLinks) {
+      if (
+        !isRecord(link) ||
+        typeof link.entryPath !== "string" ||
+        typeof link.linkpath !== "string"
+      ) {
+        throw new Error("Backup manifest contains an invalid external symbolic link.");
+      }
+      externalSymbolicLinks.push({ entryPath: link.entryPath, linkpath: link.linkpath });
+    }
+  }
+
   return {
     schemaVersion: 1,
     archiveRoot: parsed.archiveRoot,
@@ -91,23 +173,18 @@ export function parseBackupManifest(raw: string): BackupManifest {
         : "unknown",
     platform: typeof parsed.platform === "string" ? parsed.platform : "unknown",
     nodeVersion: typeof parsed.nodeVersion === "string" ? parsed.nodeVersion : "unknown",
-    options: isRecord(parsed.options)
-      ? { includeWorkspace: parsed.options.includeWorkspace as boolean | undefined }
-      : undefined,
     paths: isRecord(parsed.paths)
       ? {
-          stateDir: readStringValue(parsed.paths.stateDir),
-          configPath: readStringValue(parsed.paths.configPath),
-          oauthDir: readStringValue(parsed.paths.oauthDir),
-          workspaceDirs: Array.isArray(parsed.paths.workspaceDirs)
-            ? parsed.paths.workspaceDirs.filter(
-                (entry): entry is string => typeof entry === "string",
-              )
-            : undefined,
+          ...(parsed.paths.stateDir === undefined
+            ? {}
+            : {
+                stateDir: parseBackupManifestSourcePath(parsed.paths.stateDir, "state directory"),
+              }),
+          agentRoots: parseBackupManifestAgentRoots(parsed.paths.agentRoots),
         }
       : undefined,
     assets,
-    skipped: Array.isArray(parsed.skipped) ? parsed.skipped : undefined,
+    ...(parsed.externalSymbolicLinks === undefined ? {} : { externalSymbolicLinks }),
   };
 }
 

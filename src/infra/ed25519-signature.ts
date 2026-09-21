@@ -22,67 +22,6 @@ function assertBoundedBase64Input(input: string): void {
   }
 }
 
-// Verification runs pre-auth, so these inputs are attacker-controlled and
-// unbudgeted: every handshake buys one key parse plus one verify. The base64url
-// path is already bounded above, but the PEM path is not — `createEd25519PublicKey`
-// hands a `BEGIN`-containing string straight to `crypto.createPublicKey`, which
-// never goes through `base64UrlDecode`. These caps bound that path too, and
-// tighten the shared ceiling: a PEM-wrapped Ed25519 SPKI is ~120 chars and a raw
-// base64url key is 43, so 1024 leaves generous margin over every valid form
-// while removing three orders of magnitude of attacker-chosen parsing work.
-const MAX_PUBLIC_KEY_INPUT_CHARS = 1024;
-// A base64url-encoded 64-byte signature is 86 chars (88 padded).
-const MAX_SIGNATURE_INPUT_CHARS = 256;
-const ED25519_SIGNATURE_BYTES = 64;
-
-function looksLikePem(input: string): boolean {
-  return input.includes("BEGIN");
-}
-
-/**
- * Whether `input` could plausibly be an Ed25519 public key, judged without
- * doing any crypto. Bounds length for every form and checks the decoded byte
- * count on the raw path; full ASN.1 validation stays with `createPublicKey`.
- */
-function isPlausibleEd25519PublicKeyInput(input: unknown): input is string {
-  if (typeof input !== "string" || input.length === 0) {
-    return false;
-  }
-  if (input.length > MAX_PUBLIC_KEY_INPUT_CHARS) {
-    return false;
-  }
-  if (looksLikePem(input)) {
-    return true;
-  }
-  try {
-    return base64UrlDecode(input).length === ED25519_RAW_KEY_LENGTH;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Whether `input` could plausibly decode to a 64-byte Ed25519 signature.
- * Mirrors the base64url-then-base64 tolerance of the verify path, so the cheap
- * pre-check never rejects an input the real path would have accepted.
- */
-function isPlausibleEd25519SignatureInput(input: unknown): input is string {
-  if (typeof input !== "string" || input.length === 0) {
-    return false;
-  }
-  if (input.length > MAX_SIGNATURE_INPUT_CHARS) {
-    return false;
-  }
-  try {
-    if (base64UrlDecode(input).length === ED25519_SIGNATURE_BYTES) {
-      return true;
-    }
-  } catch {
-    return false;
-  }
-  return Buffer.from(input, "base64").length === ED25519_SIGNATURE_BYTES;
-}
-
 /** Decode the existing permissive base64url wire shape. */
 function base64UrlDecode(input: string): Buffer {
   if (input.length > MAX_BASE64URL_DECODE_INPUT_LENGTH) {
@@ -214,16 +153,21 @@ export function publicKeyRawBase64UrlFromEd25519Pem(publicKeyPem: string): strin
   return base64UrlEncode(deriveEd25519PublicKeyRaw(publicKeyPem));
 }
 
-export function normalizeEd25519PublicKeyBase64Url(publicKey: string): string | null {
-  // Reached pre-auth via device-id derivation, so bound the PEM path here too.
-  // Length only: this function deliberately normalises any non-empty decode
-  // (not just 32-byte keys), and narrowing that would change its contract.
-  if (typeof publicKey !== "string" || publicKey.length > MAX_PUBLIC_KEY_INPUT_CHARS) {
-    return null;
+// Pre-auth callers accept Node-compatible PEM, including whitespace padding.
+// Compact whitespace before bounding the actual value sent to the crypto parser.
+// Keep the trusted/canonical key parsers and permissive raw decoder unchanged.
+function boundedPublicKeyPem(publicKey: string): string {
+  const normalized = publicKey.trim().replace(/[ \t\r]+/g, " ");
+  if (normalized.length > MAX_BASE64URL_DECODE_INPUT_LENGTH) {
+    throw new Error("public key PEM exceeds the maximum allowed length");
   }
+  return normalized;
+}
+
+export function normalizeEd25519PublicKeyBase64Url(publicKey: string): string | null {
   try {
     const raw = publicKey.includes("BEGIN")
-      ? deriveEd25519PublicKeyRaw(publicKey)
+      ? deriveEd25519PublicKeyRaw(boundedPublicKeyPem(publicKey))
       : base64UrlDecode(publicKey);
     if (raw.length === 0) {
       return null;
@@ -242,10 +186,14 @@ export function signEd25519Payload(privateKeyPem: string, payload: string): stri
 
 function createEd25519PublicKey(publicKey: string): crypto.KeyObject {
   if (publicKey.includes("BEGIN")) {
-    return crypto.createPublicKey(publicKey);
+    return crypto.createPublicKey(boundedPublicKeyPem(publicKey));
+  }
+  const raw = base64UrlDecode(publicKey);
+  if (raw.length < ED25519_RAW_KEY_LENGTH) {
+    throw new Error("Ed25519 public key is too short");
   }
   return crypto.createPublicKey({
-    key: Buffer.concat([ED25519_SPKI_PREFIX, base64UrlDecode(publicKey)]),
+    key: Buffer.concat([ED25519_SPKI_PREFIX, raw]),
     type: "spki",
     format: "der",
   });
@@ -268,20 +216,12 @@ export function verifyEd25519SignatureBytes(params: {
   payload: Buffer;
   signatureBase64Url: string;
 }): boolean {
-  // Shape-check both inputs before any crypto runs. Without this an
-  // unauthenticated peer can force a full key parse plus a verify per
-  // handshake — and where a caller retries across signature versions, twice
-  // that. Rejecting implausible shapes first makes the cost of a junk
-  // handshake a length comparison instead.
-  if (
-    !isPlausibleEd25519PublicKeyInput(params.publicKey) ||
-    !isPlausibleEd25519SignatureInput(params.signatureBase64Url)
-  ) {
-    return false;
-  }
   try {
-    const key = createEd25519PublicKey(params.publicKey);
     const signature = base64UrlDecode(params.signatureBase64Url);
+    if (signature.length === 0) {
+      return false;
+    }
+    const key = createEd25519PublicKey(params.publicKey);
     return crypto.verify(null, params.payload, key, signature);
   } catch {
     return false;

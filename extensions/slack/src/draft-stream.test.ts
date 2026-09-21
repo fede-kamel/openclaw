@@ -197,20 +197,27 @@ describe("createSlackDraftStream", () => {
     expect(stream.messageId()).toBe("333.444");
   });
 
-  it("drops a posted preview detached by forceNewMessage", async () => {
-    const { stream, remove } = createDraftStreamHarness();
+  it("drains past a failed preview and retries only the retained failure", async () => {
+    const send = vi
+      .fn<DraftSendFn>()
+      .mockResolvedValueOnce(slackDraftSendResult("100.100"))
+      .mockResolvedValueOnce(slackDraftSendResult("100.300"));
+    const remove = vi.fn<DraftRemoveFn>(async () => {});
+    remove.mockRejectedValueOnce(new Error("cleanup failed"));
+    const { stream } = createDraftStreamHarness({ send, remove });
+    const removedMessageIds = () =>
+      mockCalls<Parameters<DraftRemoveFn>>(remove).map(([, messageId]) => messageId);
 
-    stream.update("working");
-    await stream.flush();
-    stream.forceNewMessage();
+    for (const text of ["first", "second"]) {
+      stream.update(text);
+      await stream.flush();
+      stream.forceNewMessage();
+    }
     await stream.dropDetachedMessages();
-    await stream.dropDetachedMessages();
+    expect(removedMessageIds()).toEqual(["100.100", "100.300"]);
 
-    expect(remove).toHaveBeenCalledOnce();
-    expect(remove).toHaveBeenCalledWith("C123", "111.222", {
-      token: "xoxb-test",
-      accountId: undefined,
-    });
+    await stream.dropDetachedMessages();
+    expect(removedMessageIds()).toEqual(["100.100", "100.300", "100.100"]);
   });
 
   it("drains previews detached during an in-flight removal", async () => {
@@ -440,6 +447,102 @@ describe("createSlackDraftStream", () => {
     expect(send).toHaveBeenCalledTimes(2);
     expect(edit).not.toHaveBeenCalled();
     expect(stream.messageId()).toBe("100.300");
+  });
+
+  it.each([false, true])(
+    "settles active-only cleanup after a delayed send (human reply: %s)",
+    async (humanReply) => {
+      const accountId = `alternate-final-during-send-${humanReply}`;
+      let resolveReceipt!: (message: ReturnType<typeof slackDraftSendResult>) => void;
+      const receipt = new Promise<ReturnType<typeof slackDraftSendResult>>((resolve) => {
+        resolveReceipt = resolve;
+      });
+      const send = vi.fn<DraftSendFn>(async () => await receipt);
+      const { stream, remove } = createDraftStreamHarness({
+        accountId,
+        threadTs: "100.000",
+        send,
+      });
+      stream.update("_checking the original request_");
+      const flushing = stream.flush();
+      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+      const clearing = stream.clear({ preserveHumanReplies: true });
+      if (humanReply) {
+        noteSlackDraftConversationMessage({
+          accountId,
+          channelId: "C123",
+          threadTs: "100.000",
+          messageTs: "100.200",
+          userId: "U_OWNER",
+        });
+      }
+      resolveReceipt(slackDraftSendResult("100.100"));
+      await Promise.all([flushing, clearing]);
+      stream.update("Late preview after final delivery");
+      await stream.flush();
+      expect(send).toHaveBeenCalledOnce();
+      expect(stream.messageId()).toBeUndefined();
+      if (humanReply) {
+        expect(remove).not.toHaveBeenCalled();
+      } else {
+        expect(remove).toHaveBeenCalledWith(
+          "C123",
+          "100.100",
+          expect.objectContaining({ accountId }),
+        );
+      }
+    },
+  );
+
+  it("releases human context while retrying failed and explicitly rotated previews", async () => {
+    const accountId = "selective-final-cleanup";
+    const visible = new Map<string, string>();
+    const ids = ["100.100", "100.300", "100.500", "100.700", "100.900"];
+    let nextId = 0;
+    let failFirstDelete = true;
+    const send = vi.fn<DraftSendFn>(async (_target, text) => {
+      const id = ids[nextId++]!;
+      visible.set(id, text);
+      return slackDraftSendResult(id);
+    });
+    const remove = vi.fn<DraftRemoveFn>(async (_channel, id) => {
+      if (id === "100.100" && failFirstDelete) {
+        failFirstDelete = false;
+        throw new Error("temporary delete failure");
+      }
+      visible.delete(id);
+    });
+    const { stream } = createDraftStreamHarness({ accountId, threadTs: "100.000", send, remove });
+
+    stream.update("failed active preview");
+    await stream.flush();
+    await stream.clear();
+    stream.forceNewMessage();
+    stream.update("explicitly rotated preview");
+    await stream.flush();
+    stream.forceNewMessage();
+    stream.update("human conversation context");
+    await stream.flush();
+    noteSlackDraftConversationMessage({
+      accountId,
+      channelId: "C123",
+      threadTs: "100.000",
+      messageTs: "100.600",
+      userId: "U_OWNER",
+    });
+    stream.update("active preview before final");
+    await stream.flush();
+    await stream.clear({ preserveHumanReplies: true });
+
+    expect([...visible.values()]).toEqual(["human conversation context"]);
+    expect(remove.mock.calls.filter(([, id]) => id === "100.100")).toHaveLength(2);
+    stream.forceNewMessage();
+    stream.update("later silent preview");
+    await stream.flush();
+    await stream.clear();
+    await stream.dropDetachedMessages();
+    expect([...visible.values()]).toEqual(["human conversation context"]);
+    expect(remove.mock.calls.some(([, id]) => id === "100.500")).toBe(false);
   });
 
   it("keeps direct-message previews after the latest unthreaded human message", async () => {
@@ -701,19 +804,18 @@ describe("createSlackDraftStream", () => {
     expect(remove).not.toHaveBeenCalled();
   });
 
-  it("clear warns when cleanup fails", async () => {
-    const remove = vi.fn<DraftRemoveFn>(async () => {
-      throw new Error("cleanup failed");
-    });
+  it("retries a failed active preview cleanup on the next clear", async () => {
+    const remove = vi.fn<DraftRemoveFn>(async () => {});
+    remove.mockRejectedValueOnce(new Error("cleanup failed"));
     const warn = vi.fn<DraftWarnFn>();
     const { stream } = createDraftStreamHarness({ remove, warn });
 
     stream.update("hello");
     await stream.flush();
     await stream.clear();
+    await stream.clear();
 
+    expect(remove).toHaveBeenCalledTimes(2);
     expect(warn).toHaveBeenCalledWith("slack stream preview cleanup failed: cleanup failed");
-    expect(stream.messageId()).toBeUndefined();
-    expect(stream.channelId()).toBeUndefined();
   });
 });

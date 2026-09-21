@@ -5,6 +5,8 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, expect, test, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
+import { resolveAgentDir, resolveAgentWorkspaceDir } from "../agents/agent-scope.js";
+import type { ModelCatalogEntry } from "../agents/model-catalog.js";
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
 import { subscribePluginSessionsChanged } from "../plugins/gateway-events.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
@@ -14,6 +16,8 @@ import {
   projectSessionDeliveryFields,
 } from "../utils/delivery-context.shared.js";
 import { createGatewayBroadcaster } from "./server-broadcast.js";
+import type { GatewayModelCatalogSnapshot } from "./server-model-catalog.types.js";
+import { GatewayClientRegistry } from "./server/client-registry.js";
 import { embeddedRunMock, rpcReq, testState, writeSessionStore } from "./test-helpers.js";
 import {
   setupGatewaySessionsTestHarness,
@@ -146,7 +150,7 @@ async function invokeSessionsList({
     isWebchatConnect: () => false,
     context: {
       getRuntimeConfig,
-      readPreparedGatewayModelCatalog: async () => [],
+      readPreparedGatewayModelCatalog: async () => ({ entries: [] }),
       ...context,
     } as never,
   });
@@ -154,6 +158,22 @@ async function invokeSessionsList({
     await request;
   }
   return { request, respond };
+}
+
+async function mutationCatalogSnapshot(
+  entries: ModelCatalogEntry[],
+): Promise<GatewayModelCatalogSnapshot> {
+  const { getRuntimeConfig } = await getGatewayConfigModule();
+  const config = getRuntimeConfig();
+  return {
+    entries,
+    routeVariants: entries,
+    agentId: "main",
+    agentDir: resolveAgentDir(config, "main"),
+    workspaceDir: resolveAgentWorkspaceDir(config, "main"),
+    config,
+    catalogComplete: true,
+  };
 }
 
 async function invokeSessionMutation({
@@ -185,6 +205,7 @@ async function invokeSessionMutation({
       dedupe: new Map(),
       getSessionEventSubscriberConnIds: () => subscribedConnIds,
       loadGatewayModelCatalog: async () => ({ providers: [] }),
+      loadGatewayModelCatalogSnapshot: () => mutationCatalogSnapshot([]),
       getRuntimeConfig,
       ...context,
     } as never,
@@ -417,14 +438,16 @@ test("sessions.list uses the gateway model catalog for effective thinking defaul
   const { respond } = await invokeSessionsList({
     requestId: "req-sessions-list-thinking-default",
     context: {
-      readPreparedGatewayModelCatalog: async () => [
-        {
-          provider: "test-provider",
-          id: "reasoner",
-          name: "Reasoner",
-          reasoning: true,
-        },
-      ],
+      readPreparedGatewayModelCatalog: async () => ({
+        entries: [
+          {
+            provider: "test-provider",
+            id: "reasoner",
+            name: "Reasoner",
+            reasoning: true,
+          },
+        ],
+      }),
     },
   });
 
@@ -470,22 +493,24 @@ test.each(["gpt-5.6-sol", "gpt-5.6-terra"])(
       },
     };
     await writeMainSessionStore({ modelProvider: "openai", model });
-    const loadGatewayModelCatalog = vi.fn(async () => [
-      {
-        provider: "openai",
-        id: model,
-        name: model,
-        reasoning: true,
-        compat: {
-          supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    const loadGatewayModelCatalogSnapshot = vi.fn(async () =>
+      mutationCatalogSnapshot([
+        {
+          provider: "openai",
+          id: model,
+          name: model,
+          reasoning: true,
+          compat: {
+            supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+          },
         },
-      },
-    ]);
+      ]),
+    );
 
     const result = await invokeSessionMutation({
       method: "sessions.patch",
       params: { key: "main", thinkingLevel: "ultra" },
-      context: { loadGatewayModelCatalog },
+      context: { loadGatewayModelCatalogSnapshot },
     });
 
     const resolved = requireRecord(result.responsePayload.resolved, "resolved patch metadata");
@@ -500,7 +525,7 @@ test.each(["gpt-5.6-sol", "gpt-5.6-terra"])(
         (level) => requireRecord(level, "thinking level").id,
       ),
     ).toContain("ultra");
-    expect(loadGatewayModelCatalog).toHaveBeenCalledTimes(1);
+    expect(loadGatewayModelCatalogSnapshot).toHaveBeenCalledTimes(1);
 
     const event = expectChangedBroadcast(result.broadcastToConnIds, {
       sessionKey: "agent:main:main",
@@ -522,25 +547,27 @@ test("sessions.patch omits thinking metadata when an unrelated patch skips the c
     model: "plain",
     thinkingLevel: "max",
   });
-  const loadGatewayModelCatalog = vi.fn(async () => [
-    {
-      provider: "synthetic",
-      id: "plain",
-      name: "plain",
-      reasoning: false,
-    },
-  ]);
+  const loadGatewayModelCatalogSnapshot = vi.fn(async () =>
+    mutationCatalogSnapshot([
+      {
+        provider: "synthetic",
+        id: "plain",
+        name: "plain",
+        reasoning: false,
+      },
+    ]),
+  );
 
   const result = await invokeSessionMutation({
     method: "sessions.patch",
     params: { key: "main", label: "Renamed" },
-    context: { loadGatewayModelCatalog },
+    context: { loadGatewayModelCatalogSnapshot },
   });
 
   const resolved = requireRecord(result.responsePayload.resolved, "resolved patch metadata");
   expect(resolved).not.toHaveProperty("thinkingLevel");
   expect(resolved).not.toHaveProperty("thinkingLevels");
-  expect(loadGatewayModelCatalog).not.toHaveBeenCalled();
+  expect(loadGatewayModelCatalogSnapshot).not.toHaveBeenCalled();
   expectChangedBroadcast(result.broadcastToConnIds, {
     sessionKey: "agent:main:main",
     reason: "patch",
@@ -696,7 +723,7 @@ test("sessions.changed mutations reach plugin subscribers without websocket clie
   await writeMainSessionStore({ label: "Original title" });
   const received = vi.fn();
   const unsubscribe = subscribePluginSessionsChanged(received);
-  const { broadcastToConnIds } = createGatewayBroadcaster({ clients: new Set() });
+  const { broadcastToConnIds } = createGatewayBroadcaster({ clients: new GatewayClientRegistry() });
 
   try {
     await invokeSessionMutation({
@@ -724,12 +751,12 @@ test("sessions.list marks sessions with active abortable runs", async () => {
   await expectListedSessionActiveRun("req-sessions-list-active-run", {}, true, "running");
 });
 
-test("sessions.list marks admitted pre-execution work as queued", async () => {
+test("sessions.list marks ordinary pre-execution work as running", async () => {
   await expectListedSessionActiveRun(
-    "req-sessions-list-queued-run",
+    "req-sessions-list-startup-run",
     { executionStarted: false },
     true,
-    "queued",
+    "running",
   );
 });
 
@@ -781,11 +808,11 @@ test("sessions.changed publishes visible active run ids", async () => {
   });
 });
 
-test("sessions.changed publishes queued status before execution starts", async () => {
+test("sessions.changed publishes running status during ordinary startup", async () => {
   await writeMainSessionStore({ status: "failed" });
   const result = await invokeSessionMutation({
     method: "sessions.patch",
-    params: { key: "main", label: "Queued main" },
+    params: { key: "main", label: "Starting main" },
     context: {
       chatAbortControllers: new Map([
         ["run-1", { sessionKey: "agent:main:main", executionStarted: false }],
@@ -796,7 +823,7 @@ test("sessions.changed publishes queued status before execution starts", async (
   expectChangedBroadcast(result.broadcastToConnIds, {
     sessionKey: "agent:main:main",
     reason: "patch",
-    status: "queued",
+    status: "running",
     hasActiveRun: true,
     activeRunIds: ["run-1"],
   });
@@ -887,7 +914,7 @@ test("sessions.list yields before responding during bulk transcript hydration", 
   const payload = expectRespondPayload(respond);
   const session = findSession(payload, "agent:main:bulk-0");
   expectFields(session, {
-    derivedTitle: "title 0",
+    derivedTitle: "Title 0",
     lastMessagePreview: "last 0",
   });
 });
@@ -1116,23 +1143,67 @@ test("sessions.changed mutation events include session management metadata", asy
     key: "discord:group:dev",
     unread: true,
   });
-  expectChangedBroadcast(unread.broadcastToConnIds, {
+  const unreadPayload = expectChangedBroadcast(unread.broadcastToConnIds, {
     sessionKey: "agent:main:discord:group:dev",
     reason: "patch",
     unread: true,
     lastReadAt: 20,
+    markedUnreadAt: expect.any(Number),
     lastActivityAt: 5,
   });
+
+  const marker = expectDefined(
+    unreadPayload.markedUnreadAt as number | undefined,
+    "manual unread marker",
+  );
+  expect(marker).toEqual(expect.any(Number));
+
+  const staleRead = await invokeSessionsPatch({
+    key: "discord:group:dev",
+    unread: false,
+    expectedMarkedUnreadAt: null,
+  });
+  expectFields(staleRead.responsePayload, { ok: true, key: "agent:main:discord:group:dev" });
+  expect(staleRead.broadcastToConnIds).not.toHaveBeenCalled();
+  expect(requireRecord(staleRead.responsePayload.entry, "stale read entry").markedUnreadAt).toBe(
+    marker,
+  );
 
   const read = await invokeSessionsPatch({
     key: "discord:group:dev",
     unread: false,
+    expectedMarkedUnreadAt: marker,
   });
   expectChangedBroadcast(read.broadcastToConnIds, {
     sessionKey: "agent:main:discord:group:dev",
     reason: "patch",
     unread: false,
     lastReadAt: expect.any(Number),
+    markedUnreadAt: null,
+    lastActivityAt: 5,
+  });
+
+  const remarked = await invokeSessionsPatch({
+    key: "discord:group:dev",
+    unread: true,
+  });
+  expectChangedBroadcast(remarked.broadcastToConnIds, {
+    sessionKey: "agent:main:discord:group:dev",
+    reason: "patch",
+    unread: true,
+    markedUnreadAt: expect.any(Number),
+  });
+
+  const legacyRead = await invokeSessionsPatch({
+    key: "discord:group:dev",
+    unread: false,
+  });
+  expectChangedBroadcast(legacyRead.broadcastToConnIds, {
+    sessionKey: "agent:main:discord:group:dev",
+    reason: "patch",
+    unread: false,
+    lastReadAt: expect.any(Number),
+    markedUnreadAt: null,
     lastActivityAt: 5,
   });
 });
@@ -1403,7 +1474,11 @@ test("sessions.changed mutation events include subagent ownership metadata", asy
     subagentRole: "orchestrator",
     subagentControlScope: "children",
     createdVia: "spawn",
-    createdActor: { type: "agent", id: "agent:main:main" },
+    createdActor: {
+      type: "agent",
+      id: "agent:main:main",
+      identity: { type: "agent", id: "agent:main:main" },
+    },
     createdAt: 1_000,
     forkSource: {
       sessionKey: "agent:main:main",

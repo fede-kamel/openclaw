@@ -27,7 +27,17 @@ const PUBLIC_CONTRACT_REFERENCE_FILES = [
   "docs/plugins/architecture.md",
   "src/plugins/contracts/plugin-sdk-subpaths.test.ts",
 ] as const;
-const TYPED_PUBLIC_CONTRACT_REFERENCE_FILES = ["docs/plugins/sdk-entrypoints.md"] as const;
+const TYPED_PUBLIC_CONTRACT_REFERENCE_FILES = [
+  "docs/plugins/sdk-entrypoints.md",
+  "docs/plugins/sdk-entrypoints/tool-policy-and-sandbox.md",
+  "docs/plugins/sdk-entrypoints/package-entries.md",
+  "docs/plugins/sdk-entrypoints/define-tool-plugin.md",
+  "docs/plugins/sdk-entrypoints/define-plugin-entry.md",
+  "docs/plugins/sdk-entrypoints/native-providers.md",
+  "docs/plugins/sdk-entrypoints/define-channel-plugin-entry.md",
+  "docs/plugins/sdk-entrypoints/define-setup-plugin-entry.md",
+  "docs/plugins/sdk-entrypoints/registration-mode.md",
+] as const;
 const PLUGIN_SDK_SUBPATH_PATTERN = /openclaw\/plugin-sdk\/([a-z0-9][a-z0-9-]*)\b/g;
 const BUNDLED_PLUGIN_FACADE_LOADER_PATTERN =
   /\bload(?:Activated)?BundledPluginPublicSurfaceModuleSync\b/;
@@ -578,6 +588,12 @@ describe("plugin-sdk package contract guardrails", () => {
     const ssrfRuntime = await import("../../plugin-sdk/ssrf-runtime.js");
 
     expect(ssrfRuntime).not.toHaveProperty("fetchConfiguredLocalOriginWithSsrFGuard");
+  });
+
+  it("keeps memory provenance mutation out of the packaged Memory Core facade", async () => {
+    const memoryCoreRuntime = await import("../../plugin-sdk/memory-core-host-runtime-core.js");
+
+    expect(memoryCoreRuntime).not.toHaveProperty("recordMemoryArtifactWriteProvenance");
   });
 
   it("keeps bundled plugin SDK compatibility subpaths explicitly classified", () => {

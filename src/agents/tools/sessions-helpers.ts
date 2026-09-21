@@ -12,10 +12,15 @@ import type { FastModeSource } from "../../shared/fast-mode.js";
  *
  * Keeps list/send/status tools aligned on rows, visibility context, and compact kind/channel labels.
  */
-import { resolveSandboxedSessionToolContext } from "./sessions-access.js";
-export {
+import {
   createAgentToAgentPolicy,
+  resolveEffectiveSessionToolsVisibility,
+  resolveSandboxedSessionToolContext,
+} from "./sessions-access.js";
+export {
   createSessionVisibilityRowChecker,
+  formatSessionToolAccessDenial,
+  recordSessionToolActionFact,
   resolveEffectiveSessionToolsVisibility,
   resolveSandboxedSessionToolContext,
   resolveSessionToolAccess,
@@ -31,8 +36,9 @@ export {
   shouldResolveSessionIdInput,
 } from "./sessions-resolution.js";
 
-/** Coarse session category used by session list/status tools. */
-type SessionKind = "main" | "group" | "cron" | "hook" | "node" | "other";
+/** Coarse session kind used by session list/status tools. */
+export const SESSION_LIST_KINDS = ["main", "group", "cron", "hook", "node", "other"] as const;
+type SessionKind = (typeof SESSION_LIST_KINDS)[number];
 
 const SESSION_KIND_BY_CLASSIFICATION: Readonly<Record<string, SessionKind>> = {
   main: "main",
@@ -52,8 +58,22 @@ type SessionListDeliveryContext = {
   threadId?: string | number;
 };
 
+type SessionInventoryMetadata = Pick<
+  SessionRow,
+  | "createdActor"
+  | "owner"
+  | "worktree"
+  | "repositoryWorkspaceId"
+  | "repository"
+  | "execCwd"
+  | "spawnedCwd"
+  | "spawnedWorkspaceDir"
+  | "projectId"
+  | "workspaceDir"
+>;
+
 /** Full Gateway session row consumed by session orchestration internals. */
-export type GatewaySessionListRow = {
+export type GatewaySessionListRow = SessionInventoryMetadata & {
   key: string;
   agentId?: string;
   classification: NonNullable<SessionRow["classification"]>;
@@ -109,14 +129,14 @@ export type GatewaySessionListRow = {
 };
 
 /** Focused model-facing row returned by sessions_list. */
-export type SessionListRow = {
+export type SessionListRow = SessionInventoryMetadata & {
   key: string;
   sessionId?: string;
   agentId: string;
   kind: SessionKind;
   channel: string;
   label?: string;
-  category?: string;
+  group?: string;
   displayName?: string;
   derivedTitle?: string;
   lastMessagePreview?: string;
@@ -138,6 +158,7 @@ export type SessionListRow = {
 export function resolveSessionToolContext(opts?: {
   agentId?: string;
   agentSessionKey?: string;
+  sessionReadScopeKey?: string;
   requesterAgentIdOverride?: string;
   sandboxed?: boolean;
   config?: OpenClawConfig;
@@ -145,16 +166,22 @@ export function resolveSessionToolContext(opts?: {
   const cfg = opts?.config ?? getRuntimeConfig();
   return {
     cfg,
+    a2aPolicy: createAgentToAgentPolicy(cfg),
+    // Only read-tool constructors accept this host-bound scope. The temporary
+    // auxiliary run keeps its execution identity but can read just the observed session.
+    sessionVisibility: opts?.sessionReadScopeKey
+      ? ("self" as const)
+      : resolveEffectiveSessionToolsVisibility({ cfg, sandboxed: opts?.sandboxed === true }),
     ...resolveSandboxedSessionToolContext({
       cfg,
-      agentSessionKey: opts?.agentSessionKey,
+      agentSessionKey: opts?.sessionReadScopeKey ?? opts?.agentSessionKey,
       requesterAgentId: opts?.requesterAgentIdOverride ?? opts?.agentId,
       sandboxed: opts?.sandboxed,
     }),
   };
 }
 
-/** Projects the Gateway's authoritative classification into the tool's coarse categories. */
+/** Projects the Gateway's authoritative classification into the tool's coarse kinds. */
 export function classifySessionListKind(params: {
   classification: NonNullable<GatewaySessionListRow["classification"]>;
   peerKind?: GatewaySessionListRow["peerKind"];

@@ -1,16 +1,16 @@
 import { buildSecretInputSchema } from "openclaw/plugin-sdk/secret-input";
+import { asNullableRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { detectWindowsSpawnCommandInlineArgs } from "openclaw/plugin-sdk/windows-spawn";
 import { z } from "zod";
 import {
   CODEX_PLUGIN_MARKETPLACE_NAME_PATTERN,
   type CodexAppServerCommandSource,
-  type CodexPluginConfig,
   type CodexPluginDestructiveApprovalMode,
   type CodexPluginDestructivePolicy,
   type CodexPluginMarketplaceName,
   type ResolvedCodexPluginPolicy,
   type ResolvedCodexPluginsPolicy,
-} from "./config-contracts.js";
+} from "./config-contracts.shared.js";
 import { normalizeCodexServiceTier } from "./config-utils.js";
 import {
   codexDiscoveryConfigSchema,
@@ -30,10 +30,8 @@ const codexAppServerHomeScopeSchema = z.enum(["agent", "user"]);
 const SecretInputSchema = buildSecretInputSchema();
 const codexAppServerPolicyModeSchema = z.enum(["yolo", "guardian"]);
 const codexAppServerApprovalPolicySchema = z.preprocess(
-  // Preserve the rest of a shipped plugin config until doctor persists the
-  // canonical value. Rejecting this field would discard the whole config.
   (value) => (value === "on-failure" ? "on-request" : value),
-  z.enum(["never", "on-request", "untrusted"]),
+  z.enum(["never", "on-request"]),
 );
 const codexAppServerSandboxSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const codexAppServerApprovalsReviewerSchema = z.enum(["user", "auto_review", "guardian_subagent"]);
@@ -56,6 +54,13 @@ const codexAppServerServiceTierSchema = z
     z.string().trim().min(1).nullable().optional(),
   )
   .optional();
+const codexAppServerCyberFailoverSchema = z
+  .object({
+    mode: z.enum(["auto", "off"]).optional(),
+    model: z.string().trim().min(1).optional(),
+    cooloffMs: z.number().positive().optional(),
+  })
+  .strict();
 const codexAppServerExperimentalSchema = z
   .object({
     sandboxExecServer: z.boolean().optional(),
@@ -177,13 +182,11 @@ const codexPluginConfigSchema = z
         codeModeOnly: z.boolean().optional(),
         loopDetectionPreToolUseRelay: z.boolean().optional(),
         requestTimeoutMs: z.number().positive().optional(),
-        turnCompletionIdleTimeoutMs: z.number().positive().optional(),
-        turnAssistantCompletionIdleTimeoutMs: z.number().positive().optional(),
-        postToolRawAssistantCompletionIdleTimeoutMs: z.number().positive().optional(),
         approvalPolicy: codexAppServerApprovalPolicySchema.optional(),
         sandbox: codexAppServerSandboxSchema.optional(),
         approvalsReviewer: codexAppServerApprovalsReviewerSchema.optional(),
         serviceTier: codexAppServerServiceTierSchema,
+        cyberFailover: codexAppServerCyberFailoverSchema.optional(),
         networkProxy: codexAppServerNetworkProxySchema.optional(),
         defaultWorkspaceDir: z.string().optional(),
         experimental: codexAppServerExperimentalSchema.optional(),
@@ -193,7 +196,21 @@ const codexPluginConfigSchema = z
   })
   .strict();
 
-export function readCodexPluginConfig(value: unknown): CodexPluginConfig {
+export type ParsedCodexSupervisionEndpoint = z.infer<typeof codexSupervisionEndpointSchema>;
+export type ParsedCodexPluginConfig = Omit<
+  z.infer<typeof codexPluginConfigSchema>,
+  "codexPlugins"
+> & {
+  codexPlugins?: z.infer<typeof codexPluginsConfigSchema>;
+};
+
+export function readCodexPluginConfig(value: unknown): ParsedCodexPluginConfig {
+  const appServer = asNullableRecord(asNullableRecord(value)?.appServer);
+  if (appServer?.approvalPolicy === "untrusted") {
+    throw new Error(
+      'plugins.entries.codex.config.appServer.approvalPolicy="untrusted" is retired; run "openclaw doctor --fix" to migrate it to "on-request".',
+    );
+  }
   const parsed = codexPluginConfigSchema.safeParse(value);
   if (!parsed.success) {
     return {};
@@ -222,6 +239,17 @@ export function isCodexRemoteExecPlacementSandbox(sandbox: unknown): boolean {
     sandbox !== null &&
     "placementExecutionMode" in sandbox &&
     sandbox.placementExecutionMode === "remote-exec"
+  );
+}
+
+export function isCodexPairedNodeRemoteExecPlacementSandbox(sandbox: unknown): boolean {
+  return (
+    isCodexRemoteExecPlacementSandbox(sandbox) &&
+    typeof sandbox === "object" &&
+    sandbox !== null &&
+    "placementNodeId" in sandbox &&
+    typeof sandbox.placementNodeId === "string" &&
+    sandbox.placementNodeId.length > 0
   );
 }
 

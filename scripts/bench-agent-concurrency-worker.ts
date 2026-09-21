@@ -228,24 +228,16 @@ async function configureSpawnRuntime(
     taskStore.configureTaskRegistryRuntime({
       store: {
         loadSnapshot: () => ({ tasks: new Map(), deliveryStates: new Map() }),
-        saveSnapshot: () => {},
         upsertTaskWithDeliveryState: () => {},
-        upsertTask: () => {},
         deleteTaskWithDeliveryState: () => {},
-        deleteTask: () => {},
         upsertDeliveryState: () => {},
-        deleteDeliveryState: () => {},
         close: () => {},
       },
     });
+    const { createInMemoryTaskFlowRegistryStore } =
+      await import("../src/test-utils/task-registry-store.js");
     flowStore.configureTaskFlowRegistryRuntime({
-      store: {
-        loadSnapshot: () => ({ flows: new Map() }),
-        saveSnapshot: () => {},
-        upsertFlow: () => {},
-        deleteFlow: () => {},
-        close: () => {},
-      },
+      store: createInMemoryTaskFlowRegistryStore(),
     });
     return;
   }
@@ -265,7 +257,15 @@ async function readDurableRows() {
     path: database.path,
     subagentRows: executeSqliteQuerySync(
       database.db,
-      db.selectFrom("subagent_runs").select(["run_id", "ended_at"]).orderBy("run_id"),
+      db
+        .selectFrom("subagent_runs")
+        .select((eb) => [
+          "run_id",
+          eb
+            .fn<number | null>("json_extract", ["payload_json", eb.val("$.execution.endedAt")])
+            .as("ended_at"),
+        ])
+        .orderBy("run_id"),
     ).rows,
     taskRows: executeSqliteQuerySync(
       database.db,
@@ -616,6 +616,7 @@ async function runSweepSample(childCount: number): Promise<Sample> {
     persist: () => {},
     clearPendingLifecycleError: () => {},
     clearPendingLifecycleTimeout: () => {},
+    clearPendingSubagentRecoveryNotice: () => true,
     sweepPendingLifecycle: () => {},
     completeSubagentRunWithRecovery: async () => {
       lostContextCompletions += 1;

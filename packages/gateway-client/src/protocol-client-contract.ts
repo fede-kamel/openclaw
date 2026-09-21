@@ -69,6 +69,7 @@ export type GatewayProtocolClientOptions<TPlan> = {
   buildConnectPlan: (params: {
     nonce: string | null;
     challengeTs: number | null | undefined;
+    serverCapabilities: readonly string[];
     generation: number;
   }) => TPlan | Promise<TPlan>;
   buildConnectParams: (plan: TPlan) => unknown;
@@ -84,6 +85,7 @@ export type GatewayProtocolClientOptions<TPlan> = {
   notifyStoppedClose?: boolean;
   onConnectError?: (error: Error) => void;
   onSocketFactoryError?: (error: Error) => void;
+  onReconnectStopped?: (error: Error) => void;
   onParseError?: (error: unknown) => void;
   onEvent?: (event: EventFrame) => void;
   onGap?: (info: { expected: number; received: number }) => void;

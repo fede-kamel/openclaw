@@ -2,7 +2,7 @@
 // Starts periodic health, dedupe, abort, and media cleanup loops.
 import { isFutureDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
 import { AGENT_RUN_TERMINAL_RETRY_GRACE_MS } from "../agents/agent-run-terminal-outcome.js";
-import { createManagedWorktreeOwnerProtection } from "../agents/worktrees/owner-protection.js";
+import { createManagedWorktreeOwnerPolicy } from "../agents/worktrees/owner-protection.js";
 import {
   managedWorktrees,
   resolveWorktreeCleanupLimits,
@@ -12,15 +12,21 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { sweepStaleRunContexts } from "../infra/agent-run-registry.js";
 import { pruneExpiredDeliveryQueueTombstones } from "../infra/delivery-queue-sqlite.js";
 import { pruneExpiredDevicePairSetupCompletions } from "../infra/device-bootstrap.js";
+import {
+  createGatewayActiveWorkSnapshot,
+  type GatewayActiveWorkInspectors,
+} from "../infra/gateway-active-work.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
 import { pruneOrphanedDeliveryQueueMedia } from "../infra/outbound/delivery-queue-media-spool.js";
+import { generateSecureInt } from "../infra/secure-random.js";
+import { checkTelemetryUpdate } from "../infra/telemetry.js";
 import { cleanOldMedia, pruneOutboundMedia, prunePlaybackTranscodeCache } from "../media/store.js";
-import { isGatewayWorkAdmissionClosed } from "../process/gateway-work-admission.js";
-import { createLazyPromiseLoader } from "../shared/lazy-promise.js";
 import {
-  runScheduledSkillCollectionReviews,
-  startSkillCollectionMaintenance,
-} from "../skills/workshop/collection-review.js";
+  isGatewayWorkAdmissionClosed,
+  tryBeginGatewaySuspendAdmission,
+} from "../process/gateway-work-admission.js";
+import { createLazyPromiseLoader } from "../shared/lazy-promise.js";
+import { registerSkillUsageTracking } from "../skills/workshop/curator.js";
 import {
   abortChatRunById,
   type ChatAbortControllerEntry,
@@ -30,7 +36,10 @@ import {
 import type { QueuedChatTurnMap } from "./chat-queued-turns.js";
 import { pruneStaleControlPlaneBuckets } from "./control-plane-rate-limit.js";
 import type { HealthSummary } from "./health/types.js";
-import { createHostThawRecovery } from "./host-thaw-recovery.js";
+import {
+  createHostThawRecovery,
+  type HostThawChannelRestartOutcome,
+} from "./host-thaw-recovery.js";
 import { chatAbortMarkerTimestampMs } from "./server-chat-state.js";
 import type { ChatRunState } from "./server-chat-state.js";
 import type { ChatRunEntry } from "./server-chat.js";
@@ -51,11 +60,13 @@ import { hasRegisteredChatRunForSessionKey } from "./server-methods/session-acti
 import { PENDING_CHAT_SEND_DEDUPE_PREFIX, type DedupeEntry } from "./server-shared.js";
 import { formatError } from "./server-utils.js";
 import { setBroadcastHealthUpdate } from "./server/health-state.js";
+import { startSessionColdStorageMaintenance } from "./session-cold-storage-maintenance.js";
 import { tryResolveSessionCompatibilityOwnerAgentId } from "./session-request-agent.js";
 
 // Hourly sweep plus a one-day grace bounds orphan storage without racing the
 // stage-before-row-commit window.
 const DELIVERY_QUEUE_MEDIA_GC_INTERVAL_MS = 60 * 60_000;
+const TELEMETRY_MAINTENANCE_INTERVAL_MS = 5 * 60_000;
 
 export function startGatewayMaintenanceTimers(params: {
   broadcast: (
@@ -74,7 +85,11 @@ export function startGatewayMaintenanceTimers(params: {
     includeSensitive?: boolean;
   }) => Promise<HealthSummary>;
   logHealth: { info: (msg: string) => void; error: (msg: string) => void };
-  restartRunningChannels: () => Promise<void>;
+  restartRunningChannels: (
+    mode: "new-thaw" | "deferred-retry",
+    shouldContinue?: () => boolean,
+  ) => Promise<boolean>;
+  activeWorkInspectors: Partial<GatewayActiveWorkInspectors>;
   refreshPresence: () => void;
   resetEventLoopHealth: () => void;
   dedupe: Map<string, DedupeEntry>;
@@ -89,21 +104,20 @@ export function startGatewayMaintenanceTimers(params: {
   ) => ChatRunEntry | undefined;
   agentRunSeq: Map<string, number>;
   nodeSendToSession: (sessionKey: string, event: string, payload: unknown) => void;
-  mediaCleanupTtlMs?: number;
+  isNixMode?: boolean;
   getRuntimeConfig: () => OpenClawConfig;
   runWorktreeGc?: () => Promise<unknown>;
   runDeliveryQueueMediaGc?: () => Promise<unknown>;
   runManagedOutgoingMediaGc?: () => Promise<unknown>;
-  enableSkillCurator?: boolean;
-  runSkillCollectionReconcile?: () => Promise<unknown>;
 }): {
   tickInterval: ReturnType<typeof setInterval>;
   healthInterval: ReturnType<typeof setInterval>;
   dedupeCleanup: ReturnType<typeof setInterval>;
   startMediaCleanup: () => void;
   stopMediaCleanup: () => Promise<MediaCleanupStopResult>;
+  stopSessionColdStorageMaintenance: () => Promise<void>;
   worktreeCleanup: ReturnType<typeof setInterval>;
-  skillCuratorCleanup: () => void;
+  skillUsageCleanup: () => void;
 } {
   setBroadcastHealthUpdate((snap: HealthSummary) => {
     params.broadcast("health", snap, {
@@ -115,9 +129,40 @@ export function startGatewayMaintenanceTimers(params: {
     params.nodeSendToAllSubscribed("health", snap);
   });
 
+  const restartChannelsIfIdle = async (
+    mode: "new-thaw" | "deferred-retry",
+  ): Promise<HostThawChannelRestartOutcome> => {
+    const snapshot = createGatewayActiveWorkSnapshot(params.activeWorkInspectors, {
+      ignoreTerminalSessions: true,
+    });
+    if (!snapshot.idle) {
+      return { status: "retry", reason: "active-work" };
+    }
+    // Inspection and admission commit are synchronous: no new work can enter
+    // between them, and a busy tick never changes the admission phase.
+    let invalidated = false;
+    const admission = tryBeginGatewaySuspendAdmission(() => {
+      invalidated = true;
+    });
+    if (!admission) {
+      return { status: "retry", reason: "admission-closed" };
+    }
+    if (!admission.commit()) {
+      return { status: "retry", reason: "admission-closed" };
+    }
+    try {
+      const restarted = await params.restartRunningChannels(mode, () => !invalidated);
+      return restarted
+        ? { status: "completed" }
+        : { status: "retry", reason: "channel-restart-incomplete" };
+    } finally {
+      admission.release();
+    }
+  };
+
   const hostThawRecovery = createHostThawRecovery({
     nowMs: Date.now,
-    restartChannels: params.restartRunningChannels,
+    restartChannelsIfIdle,
     refreshHealth: async () => {
       await params.refreshGatewayHealthSnapshot({ probe: true });
     },
@@ -127,10 +172,19 @@ export function startGatewayMaintenanceTimers(params: {
     logger: params.logHealth,
   });
 
+  let nextTelemetryCheckAtMs = Date.now() + generateSecureInt(TELEMETRY_MAINTENANCE_INTERVAL_MS);
   // periodic keepalive
   const tickInterval = setInterval(() => {
     void hostThawRecovery.tick();
-    const payload = { ts: Date.now() };
+    const now = Date.now();
+    if (!params.isNixMode && now >= nextTelemetryCheckAtMs) {
+      nextTelemetryCheckAtMs =
+        now +
+        TELEMETRY_MAINTENANCE_INTERVAL_MS +
+        generateSecureInt(TELEMETRY_MAINTENANCE_INTERVAL_MS);
+      void checkTelemetryUpdate(params.getRuntimeConfig(), { surface: "gateway" }).catch(() => {});
+    }
+    const payload = { ts: now };
     params.broadcast("tick", payload);
     params.nodeSendToAllSubscribed("tick", payload);
   }, TICK_INTERVAL_MS);
@@ -155,8 +209,7 @@ export function startGatewayMaintenanceTimers(params: {
       return managedWorktrees.gc({
         // Chat runs avoid registry acquire/bump writes; recent session metadata substitutes for
         // worktree activity so idle GC cannot remove a checkout still used by the session.
-        shouldProtectOwner: createManagedWorktreeOwnerProtection(cfg),
-        // Read limits per run so a config edit applies at the next hourly sweep.
+        ...createManagedWorktreeOwnerPolicy(cfg),
         limits: resolveWorktreeCleanupLimits(),
       });
     });
@@ -213,23 +266,7 @@ export function startGatewayMaintenanceTimers(params: {
   };
   void performDevicePairSetupCompletionGc(Date.now());
 
-  let skillCuratorCleanup = () => {};
-  if (params.enableSkillCurator) {
-    skillCuratorCleanup = startSkillCollectionMaintenance({
-      onError: (err) =>
-        params.logHealth.error(`skill collection review failed: ${formatError(err)}`),
-      run:
-        params.runSkillCollectionReconcile ??
-        (() =>
-          runScheduledSkillCollectionReviews({
-            config: params.getRuntimeConfig(),
-            onError: (err, workspaceDir) =>
-              params.logHealth.error(
-                `skill collection review failed for ${workspaceDir}: ${formatError(err)}`,
-              ),
-          })),
-    });
-  }
+  const skillUsageCleanup = registerSkillUsageTracking();
 
   // dedupe cache cleanup
   const dedupeCleanup = setInterval(() => {
@@ -428,13 +465,13 @@ export function startGatewayMaintenanceTimers(params: {
 
   let mediaCleanupInFlight: Promise<void> | null = null;
   const runMediaCleanup = () => {
-    const ttlMs = params.mediaCleanupTtlMs;
     if (mediaCleanupInFlight) {
       return mediaCleanupInFlight;
     }
+    const ttlHours = params.getRuntimeConfig().attachments?.ttlHours;
     const cleanup =
-      typeof ttlMs === "number"
-        ? cleanOldMedia(ttlMs, { recursive: true, pruneEmptyDirs: true })
+      ttlHours !== undefined
+        ? cleanOldMedia(ttlHours * 60 * 60_000, { recursive: true, pruneEmptyDirs: true })
         : pruneOutboundMedia();
     mediaCleanupInFlight = cleanup
       .catch((err: unknown) => {
@@ -502,13 +539,19 @@ export function startGatewayMaintenanceTimers(params: {
     return stopMediaCleanupPromise;
   };
 
+  const sessionColdStorageMaintenance = startSessionColdStorageMaintenance({
+    getRuntimeConfig: params.getRuntimeConfig,
+    onError: (message) => params.logHealth.error(`transcript cold storage failed: ${message}`),
+  });
+
   return {
     tickInterval,
     healthInterval,
     dedupeCleanup,
     startMediaCleanup,
     stopMediaCleanup,
+    stopSessionColdStorageMaintenance: sessionColdStorageMaintenance.stop,
     worktreeCleanup,
-    skillCuratorCleanup,
+    skillUsageCleanup,
   };
 }

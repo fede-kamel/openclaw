@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { createAuthProfileStoreFixture } from "../agents/auth-profiles/credential-fixtures.test-support.js";
 import {
   noteCommittedSharedAuthStoreOwnership,
   resolveSharedAuthStorePath,
@@ -291,6 +292,32 @@ describe("secrets audit", () => {
     expectFindingCode(report, "PLAINTEXT_FOUND");
   });
 
+  it("audits inactive Talk speech and realtime provider references independently", async () => {
+    const activeKey = { source: "env", provider: "default", id: OPENAI_API_KEY_MARKER };
+    const providerSelection = (missingKey: string) => ({
+      provider: "openai",
+      providers: {
+        openai: { apiKey: activeKey },
+        inactive: { apiKey: { source: "env", provider: "default", id: missingKey } },
+      },
+    });
+    await writeJsonFile(fixture.configPath, {
+      talk: {
+        ...providerSelection("MISSING_TALK_SPEECH_KEY"),
+        realtime: providerSelection("MISSING_TALK_REALTIME_KEY"),
+      },
+    });
+
+    const report = await runSecretsAudit({ env: fixture.env });
+
+    expect(
+      report.findings
+        .filter((finding) => finding.code === "REF_UNRESOLVED")
+        .map((finding) => finding.jsonPath)
+        .toSorted(),
+    ).toEqual(["talk.providers.inactive.apiKey", "talk.realtime.providers.inactive.apiKey"]);
+  });
+
   it("reports plaintext that duplicates the store while resolving store refs", async () => {
     writeSecretStoreEntry({
       scope: { kind: "team" },
@@ -315,11 +342,19 @@ describe("secrets audit", () => {
             apiKey: { source: "store", provider: "default", id: "STORED_API_KEY" },
             models: [{ id: "fixture", name: "fixture" }],
           },
+          envReferenced: {
+            baseUrl: "https://env-referenced.example.test/v1",
+            api: "openai-completions",
+            apiKey: "${AUDIT_STORE_VALUE}",
+            models: [{ id: "fixture", name: "fixture" }],
+          },
         },
       },
     });
 
-    const report = await runSecretsAudit({ env: fixture.env });
+    const report = await runSecretsAudit({
+      env: { ...fixture.env, AUDIT_STORE_VALUE: "shared-store-value" },
+    });
     expect(report.summary.storeResidueCount).toBe(1);
     expect(report.findings.find((entry) => entry.code === "STORE_PLAINTEXT_RESIDUE")).toMatchObject(
       {
@@ -715,16 +750,13 @@ describe("secrets audit", () => {
     const ambientAgentDir = path.join(ambientStateDir, "agents", "main", "agent");
     vi.stubEnv("OPENCLAW_STATE_DIR", ambientStateDir);
     writePersistedAuthProfileStoreRaw(
-      {
-        version: 1,
-        profiles: {
-          "openai:ambient": {
-            type: "api_key",
-            provider: "openai",
-            key: "sk-ambient-plaintext",
-          },
+      createAuthProfileStoreFixture({
+        "openai:ambient": {
+          type: "api_key",
+          provider: "openai",
+          key: "sk-ambient-plaintext",
         },
-      },
+      }),
       ambientAgentDir,
     );
     const stateDatabase = openOpenClawStateDatabase({ env: fixture.env }).db;
@@ -736,20 +768,19 @@ describe("secrets audit", () => {
       .run(JSON.stringify({ location: "state-db" }));
     stateDatabase
       .prepare(
-        "INSERT INTO auth_profile_stores (store_key, store_json, updated_at) VALUES (?, ?, 1)",
+        "INSERT INTO config_machine_state (state_key, value_json, updated_at_ms) VALUES (?, ?, 1)",
       )
       .run(
-        "shared",
-        JSON.stringify({
-          version: 1,
-          profiles: {
+        "authProfiles.store",
+        JSON.stringify(
+          createAuthProfileStoreFixture({
             "openai:target": {
               type: "api_key",
               provider: "openai",
               key: "sk-target-plaintext",
             },
-          },
-        }),
+          }),
+        ),
       );
     noteCommittedSharedAuthStoreOwnership({ location: "state-db" }, fixture.env);
 
@@ -810,12 +841,37 @@ describe("secrets audit", () => {
     ).toBe(true);
   });
 
-  it("exempts only known openclaw.json model provider apiKey markers", async () => {
-    for (const { apiKey, isPlaintext } of [
-      { apiKey: "lmstudio-local", isPlaintext: false },
-      { apiKey: "ollama-local", isPlaintext: false },
-      { apiKey: "sk-real-plaintext", isPlaintext: true },
-    ]) {
+  it.each([
+    { name: "lmstudio marker", apiKey: "lmstudio-local", isPlaintext: false, refsChecked: 0 },
+    { name: "ollama marker", apiKey: "ollama-local", isPlaintext: false, refsChecked: 0 },
+    { name: "plaintext", apiKey: "sk-real-plaintext", isPlaintext: true, refsChecked: 0 },
+    {
+      name: "resolved shorthand",
+      apiKey: "${OPENAI_API_KEY}",
+      isPlaintext: false,
+      refsChecked: 1,
+    },
+    {
+      name: "pending shorthand",
+      apiKey: "$OPENAI_API_KEY",
+      isPlaintext: false,
+      refsChecked: 1,
+    },
+    {
+      name: "structured reference",
+      apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" },
+      isPlaintext: false,
+      refsChecked: 1,
+    },
+    {
+      name: "escaped literal",
+      apiKey: "$${OPENAI_API_KEY}",
+      isPlaintext: true,
+      refsChecked: 0,
+    },
+  ])(
+    "classifies config provider credentials from $name",
+    async ({ apiKey, isPlaintext, refsChecked }) => {
       await writeJsonFile(fixture.configPath, {
         models: {
           providers: {
@@ -839,8 +895,9 @@ describe("secrets audit", () => {
             entry.jsonPath === "models.providers.openai.apiKey",
         ),
       ).toBe(isPlaintext);
-    }
-  });
+      expect(report.resolution.refsChecked).toBe(refsChecked);
+    },
+  );
 
   it("scans .env in legacy .clawdbot state directory via automatic fallback", async () => {
     // Do NOT set OPENCLAW_STATE_DIR or OPENCLAW_CONFIG_PATH — rely on

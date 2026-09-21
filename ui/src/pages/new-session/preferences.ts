@@ -10,8 +10,23 @@ export const PREFS_MIGRATION_KEY = "new-session.migration.v1";
 
 export type NewSessionWhere =
   | { kind: "local" }
+  | { kind: "auto-device" }
   | { kind: "device"; id: string }
   | { kind: "cloud"; id: string };
+
+export function resolveNewSessionWhere(params: {
+  cloudProfileId: string;
+  deviceId: string;
+  autoDevice: boolean;
+}): NewSessionWhere {
+  return params.cloudProfileId
+    ? { kind: "cloud", id: params.cloudProfileId }
+    : params.deviceId
+      ? { kind: "device", id: params.deviceId }
+      : params.autoDevice
+        ? { kind: "auto-device" }
+        : { kind: "local" };
+}
 
 export type NewSessionPreference = {
   workspace?: string;
@@ -19,11 +34,32 @@ export type NewSessionPreference = {
   where?: NewSessionWhere;
   projectId?: string;
   worktree?: boolean;
+  freshWorkspace?: boolean;
   baseRef?: string;
   worktreeName?: string;
   model?: string;
+  agentRuntime?: string;
   thinkingLevel?: string;
 };
+
+export function resolveNewSessionFolderPreference(
+  preference: NewSessionPreference | null,
+  workspace: string,
+) {
+  const storedFolder = preference?.folder ?? "";
+  const workspaceMoved =
+    Boolean(storedFolder) &&
+    storedFolder === preference?.workspace &&
+    preference.workspace !== workspace;
+  const folder = storedFolder && !workspaceMoved ? storedFolder : workspace;
+  return {
+    folder,
+    workspaceMoved,
+    freshWorkspace:
+      preference?.freshWorkspace ??
+      !(preference?.worktree === true || preference?.projectId || (folder && folder !== workspace)),
+  };
+}
 
 type PersistedPreferences = {
   agents?: Record<string, NewSessionPreference>;
@@ -44,8 +80,16 @@ function normalizePreference(value: unknown): NewSessionPreference | null {
   const baseRef = normalizeOptionalString(record.baseRef);
   const worktreeName = normalizeOptionalString(record.worktreeName);
   const model = normalizeOptionalString(record.model);
+  const agentRuntime = model ? normalizeOptionalString(record.agentRuntime) : undefined;
   const thinkingLevel = normalizeOptionalString(record.thinkingLevel);
   const worktree = typeof record.worktree === "boolean" ? record.worktree : undefined;
+  // Preserve the legacy source choice before Git discovery can clear worktree availability.
+  const freshWorkspace =
+    typeof record.freshWorkspace === "boolean"
+      ? record.freshWorkspace
+      : worktree === true
+        ? false
+        : undefined;
   const where = normalizeWhere(record.where);
   if (
     !workspace &&
@@ -53,6 +97,7 @@ function normalizePreference(value: unknown): NewSessionPreference | null {
     !where &&
     !projectId &&
     worktree === undefined &&
+    freshWorkspace === undefined &&
     !baseRef &&
     !worktreeName &&
     !model &&
@@ -66,9 +111,11 @@ function normalizePreference(value: unknown): NewSessionPreference | null {
     ...(where ? { where } : {}),
     ...(projectId ? { projectId } : {}),
     ...(worktree !== undefined ? { worktree } : {}),
+    ...(freshWorkspace !== undefined ? { freshWorkspace } : {}),
     ...(baseRef ? { baseRef } : {}),
     ...(worktreeName ? { worktreeName } : {}),
     ...(model ? { model } : {}),
+    ...(agentRuntime ? { agentRuntime } : {}),
     ...(thinkingLevel ? { thinkingLevel } : {}),
   };
 }
@@ -77,8 +124,8 @@ function normalizeWhere(value: unknown): NewSessionWhere | undefined {
   if (!isRecord(value) || typeof value.kind !== "string") {
     return undefined;
   }
-  if (value.kind === "local") {
-    return { kind: "local" };
+  if (value.kind === "local" || value.kind === "auto-device") {
+    return { kind: value.kind };
   }
   const id = normalizeOptionalString(value.id);
   return id && (value.kind === "device" || value.kind === "cloud")
@@ -158,16 +205,22 @@ export function replaceBrowserPreference(
   const storage = getSafeLocalStorage();
   const normalizedAgentId = normalizeAgentId(agentId);
   const normalized = normalizePreference(preference);
-  if (!storage || !gatewayUrl || !normalizedAgentId || !normalized) {
+  if (!storage || !gatewayUrl || !normalizedAgentId) {
     return;
   }
   const store = readStore(storage, gatewayUrl);
+  const agents = { ...store.agents };
+  if (normalized) {
+    agents[normalizedAgentId] = normalized;
+  } else {
+    delete agents[normalizedAgentId];
+  }
   try {
     storage.setItem(
       storageKey(gatewayUrl),
       JSON.stringify({
         ...store,
-        agents: { ...store.agents, [normalizedAgentId]: normalized },
+        agents,
       } satisfies PersistedPreferences),
     );
   } catch {
@@ -188,15 +241,19 @@ export function patchNewSessionPreference(
   const store = readStore(storage, gatewayUrl);
   const current = normalizePreference(store.agents?.[normalizedAgentId]) ?? {};
   const next = normalizePreference({ ...current, ...patch });
-  if (!next) {
-    return;
+  const agents = { ...store.agents };
+  if (next) {
+    agents[normalizedAgentId] = next;
+  } else {
+    // Clearing the final selection removes the preference; it is not an omitted patch.
+    delete agents[normalizedAgentId];
   }
   try {
     storage.setItem(
       storageKey(gatewayUrl),
       JSON.stringify({
         ...store,
-        agents: { ...store.agents, [normalizedAgentId]: next },
+        agents,
       } satisfies PersistedPreferences),
     );
   } catch {
