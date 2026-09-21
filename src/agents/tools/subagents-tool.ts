@@ -4,18 +4,32 @@
  * Lists and cancels background work in the caller's session tree.
  */
 import { Type } from "typebox";
+import { resolveAcpSessionControlOwner } from "../../acp/runtime/session-control-owner.js";
+import { readAcpSessionEntry } from "../../acp/runtime/session-meta.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { createAbortError } from "../../infra/abort-signal.js";
-import { listTaskRecordsUnsorted } from "../../tasks/runtime-internal.js";
+import {
+  listTaskRecordsForOwnerTree,
+  prepareTaskRegistryRead,
+} from "../../tasks/runtime-internal.js";
 import { readTaskBackingInstance } from "../../tasks/task-backing-records.js";
+import {
+  withTaskCancellationContext,
+  type TaskCancellationTarget,
+} from "../../tasks/task-cancellation-context.js";
 import { getTaskExecutionObservation } from "../../tasks/task-execution-observation.js";
 import { cancelDetachedTaskRunById } from "../../tasks/task-executor.js";
-import { onTaskRegistryChange } from "../../tasks/task-registry-state.js";
+import { onTaskRegistryChange } from "../../tasks/task-registry.store.js";
+import type { TaskRegistryObserverEvent } from "../../tasks/task-registry.store.types.js";
 import type { TaskRecord, TaskStatus } from "../../tasks/task-registry.types.js";
 import { resolveTaskSessionAgentId } from "../../tasks/task-session-identity.js";
 import { TASK_STATUS_DETAIL_MAX_CHARS, sanitizeTaskStatusText } from "../../tasks/task-status.js";
 import { optionalPositiveIntegerSchema, optionalStringEnum } from "../schema/typebox.js";
+import {
+  ensureSubagentControllerOwnsRun,
+  isSubagentRunVisibleToSession,
+} from "../subagents/registry/subagent-control-scope.js";
 import {
   DEFAULT_RECENT_MINUTES,
   listControlledSubagentRuns,
@@ -23,6 +37,7 @@ import {
   resolveSubagentController,
 } from "../subagents/registry/subagent-control.js";
 import { buildSubagentList } from "../subagents/registry/subagent-list.js";
+import { buildLatestSubagentRunReadIndex } from "../subagents/registry/subagent-registry-read.js";
 import { onSubagentRegistryPersisted } from "../subagents/registry/subagent-registry-state.js";
 import type { AnyAgentTool } from "./common.js";
 import {
@@ -64,7 +79,7 @@ type SubagentsToolOptions = {
   callerPolicySessionKey?: string;
   agentId?: string;
   config?: OpenClawConfig;
-  listTasks?: typeof listTaskRecordsUnsorted;
+  listTasks?: () => TaskRecord[];
   cancelTask?: typeof cancelDetachedTaskRunById;
 };
 
@@ -73,7 +88,7 @@ function taskUpdatedAt(task: TaskRecord): number {
 }
 
 function taskOwnerMatches(
-  task: TaskRecord,
+  task: TaskCancellationTarget,
   allowedOwnerKeys: ReadonlySet<string>,
   agentId: string,
   cfg: OpenClawConfig,
@@ -84,19 +99,33 @@ function taskOwnerMatches(
   );
 }
 
-function listTreeTasks(
+function readTaskTree(
   tasks: TaskRecord[],
   rootSessionKeys: ReadonlySet<string>,
   rootAgentId: string,
   cfg: OpenClawConfig,
-  requireCurrentSubagentOwnership = false,
-): TaskRecord[] {
-  const visibleSessions = new Set<string>();
+  subagentOwnership: "retained" | "visible" | "controlled" = "retained",
+) {
+  const visibleSessions = new Map<
+    string,
+    { controllerSessionKey: string; controllerAgentId: string }
+  >();
   for (const key of rootSessionKeys) {
-    visibleSessions.add(`${rootAgentId}\0${key}`);
+    visibleSessions.set(`${rootAgentId}\0${key}`, {
+      controllerSessionKey: key,
+      controllerAgentId: rootAgentId,
+    });
   }
   const visibleTasks = new Set<string>();
-  const controlledRunsByOwner = new Map<string, ReturnType<typeof listControlledSubagentRuns>>();
+  const subagentReadIndex =
+    subagentOwnership === "retained"
+      ? undefined
+      : buildLatestSubagentRunReadIndex(
+          tasks.flatMap((task) =>
+            task.runtime === "subagent" && task.childSessionKey ? [task.childSessionKey] : [],
+          ),
+        );
+  const acpControlOwners = new Map<string, string | undefined>();
   let changed = true;
   while (changed) {
     changed = false;
@@ -113,39 +142,64 @@ function listTreeTasks(
         continue;
       }
       if (
-        requireCurrentSubagentOwnership &&
+        subagentOwnership !== "retained" &&
         task.runtime === "subagent" &&
-        readTaskBackingInstance(task.detail)?.runtime === "subagent" &&
+        (subagentOwnership === "controlled" ||
+          readTaskBackingInstance(task.detail)?.runtime === "subagent") &&
         task.runId &&
         task.childSessionKey
       ) {
-        const owner = `${taskRequesterAgentId ?? ""}\0${task.ownerKey}`;
-        let controlledRuns = controlledRunsByOwner.get(owner);
-        if (!controlledRuns) {
-          controlledRuns = listControlledSubagentRuns(task.ownerKey, taskRequesterAgentId, cfg);
-          controlledRunsByOwner.set(owner, controlledRuns);
-        }
+        const run = subagentReadIndex?.getLatestSubagentRun(task.childSessionKey);
         if (
-          !controlledRuns.some(
-            (run) =>
-              run.childSessionKey === task.childSessionKey &&
-              (run.taskRunId ?? run.runId) === task.runId,
-          )
+          !run ||
+          !taskRequesterAgentId ||
+          !isSubagentRunVisibleToSession(run, task.ownerKey, taskRequesterAgentId, cfg) ||
+          (run.taskRunId ?? run.runId) !== task.runId ||
+          (subagentOwnership === "controlled" &&
+            ![...visibleSessions.values()].some(
+              (controller) =>
+                ensureSubagentControllerOwnsRun({ cfg, controller, entry: run }) === undefined,
+            ))
         ) {
           continue;
         }
       }
       visibleTasks.add(task.taskId);
       if (task.childSessionKey) {
-        const childIdentity = `${task.agentId ?? taskRequesterAgentId ?? ""}\0${task.childSessionKey}`;
+        const childAgentId = task.agentId ?? taskRequesterAgentId ?? "";
+        const childIdentity = `${childAgentId}\0${task.childSessionKey}`;
         if (!visibleSessions.has(childIdentity)) {
-          visibleSessions.add(childIdentity);
+          // Retained task rows remain readable; ACP control edges follow the current owner.
+          if (subagentOwnership === "controlled" && task.runtime === "acp") {
+            if (!acpControlOwners.has(childIdentity)) {
+              const current = readAcpSessionEntry({
+                cfg,
+                sessionKey: task.childSessionKey,
+                agentId: task.agentId,
+                clone: false,
+              });
+              acpControlOwners.set(
+                childIdentity,
+                current?.acp ? resolveAcpSessionControlOwner(current.entry) : undefined,
+              );
+            }
+            if (acpControlOwners.get(childIdentity) !== task.ownerKey) {
+              continue;
+            }
+          }
+          visibleSessions.set(childIdentity, {
+            controllerSessionKey: task.childSessionKey,
+            controllerAgentId: childAgentId,
+          });
           changed = true;
         }
       }
     }
   }
-  return tasks.filter((task) => visibleTasks.has(task.taskId));
+  return {
+    tasks: tasks.filter((task) => visibleTasks.has(task.taskId)),
+    sessions: visibleSessions,
+  };
 }
 
 function mapTask(task: TaskRecord) {
@@ -160,9 +214,6 @@ function mapTask(task: TaskRecord) {
     runtime: task.runtime,
     deliveryStatus: task.deliveryStatus,
     ...(execution ? { execution } : {}),
-    ...(execution.wait?.kind === "external" && task.childSessionKey
-      ? { resume: { method: "sessions.send", sessionKey: task.childSessionKey } }
-      : {}),
     status:
       task.status === "succeeded" && task.terminalOutcome === "blocked"
         ? "blocked"
@@ -178,6 +229,8 @@ function mapTask(task: TaskRecord) {
 function waitForSelectedTasks(params: {
   taskIds: string[];
   readTasks: () => TaskRecord[];
+  taskChangeAffectsRead: (event?: TaskRegistryObserverEvent) => boolean;
+  subagentChangeAffectsRead: (sessionKeys?: readonly (string | undefined)[]) => boolean;
   timeoutMs: number;
   signal?: AbortSignal;
 }) {
@@ -246,8 +299,28 @@ function waitForSelectedTasks(params: {
     };
     const onAbort = () =>
       finish(createAbortError("subagents wait aborted; tasks continue running."));
-    const unsubscribeTasks = onTaskRegistryChange(() => finish());
-    const unsubscribeSubagents = onSubagentRegistryPersisted(() => finish());
+    let wakeQueued = false;
+    const wake = () => {
+      if (wakeQueued || settled) {
+        return;
+      }
+      wakeQueued = true;
+      // The publisher retires its mutation before a reader checks the resulting identity.
+      queueMicrotask(() => {
+        wakeQueued = false;
+        finish();
+      });
+    };
+    const unsubscribeTasks = onTaskRegistryChange((event) => {
+      if (params.taskChangeAffectsRead(event)) {
+        wake();
+      }
+    });
+    const unsubscribeSubagents = onSubagentRegistryPersisted((keys) => {
+      if (params.subagentChangeAffectsRead(keys)) {
+        wake();
+      }
+    });
     unsubscribe = () => {
       unsubscribeTasks();
       unsubscribeSubagents();
@@ -284,6 +357,34 @@ export function createSubagentsTool(opts: SubagentsToolOptions = {}): AnyAgentTo
     }
     return { cfg, controller, controllerAgentId, allowedOwnerKeys };
   };
+  const assertCancellationControl = (task: TaskCancellationTarget) => {
+    const current = readScope();
+    if (task.scopeKind !== "session") {
+      throw new Error("Task outside session tree.");
+    }
+    if (taskOwnerMatches(task, current.allowedOwnerKeys, current.controllerAgentId, current.cfg)) {
+      return;
+    }
+    if (current.controller.controlScope !== "children") {
+      throw new Error("Leaf subagents cannot cancel other sessions.");
+    }
+    const tree = readTaskTree(
+      opts.listTasks?.() ?? listTaskRecordsForOwnerTree(current.allowedOwnerKeys),
+      current.allowedOwnerKeys,
+      current.controllerAgentId,
+      current.cfg,
+      "controlled",
+    );
+    const ownerAgentId = resolveTaskSessionAgentId(
+      task.ownerKey,
+      task.requesterAgentId,
+      current.cfg,
+    );
+    // Runtime owners fence the selected target; this check fences its caller ancestry.
+    if (!tree.sessions.has(`${ownerAgentId ?? ""}\0${task.ownerKey}`)) {
+      throw new Error("Task outside session tree.");
+    }
+  };
   return {
     label: "Subagents",
     name: "subagents",
@@ -298,16 +399,19 @@ export function createSubagentsTool(opts: SubagentsToolOptions = {}): AnyAgentTo
         recentMinutesRaw === undefined
           ? DEFAULT_RECENT_MINUTES
           : Math.min(MAX_RECENT_MINUTES, recentMinutesRaw);
-      const readTreeTasks = () => {
-        const current = readScope();
-        return listTreeTasks(
-          (opts.listTasks ?? listTaskRecordsUnsorted)(),
-          current.allowedOwnerKeys,
-          current.controllerAgentId,
-          current.cfg,
-          true,
-        );
-      };
+      const prepared =
+        !opts.listTasks && (action === "list" || action === "wait")
+          ? await prepareTaskRegistryRead()
+          : undefined;
+      if (!opts.listTasks && (action === "list" || action === "wait") && !prepared) {
+        throw new Error("Task activity did not stabilize. Retry the task read.");
+      }
+      const listTasks = (owners: ReadonlySet<string>) =>
+        opts.listTasks
+          ? opts.listTasks()
+          : prepared
+            ? prepared.listTaskRecordsForOwnerTree(owners)
+            : listTaskRecordsForOwnerTree(owners);
 
       if (action === "wait") {
         const taskIds = [...new Set(readStringArrayParam(params, "taskIds", { required: true }))];
@@ -318,21 +422,69 @@ export function createSubagentsTool(opts: SubagentsToolOptions = {}): AnyAgentTo
           60,
           readNonNegativeIntegerParam(params, "timeoutSeconds") ?? 30,
         );
+        let dependencies = new Set(taskIds);
+        let ancestorSessionKeys = new Set<string>();
+        let subagentSessionKeys = new Set<string>();
+        const readSelectedTasks = () => {
+          const current = readScope();
+          const isRootTask = (task: Readonly<TaskRecord>) =>
+            taskOwnerMatches(
+              task,
+              current.allowedOwnerKeys,
+              current.controllerAgentId,
+              current.cfg,
+            );
+          const candidates = opts.listTasks
+            ? opts.listTasks()
+            : prepared!.listTaskRecordsWithAncestors(taskIds, isRootTask);
+          dependencies = new Set([...taskIds, ...candidates.map((task) => task.taskId)]);
+          ancestorSessionKeys = new Set(
+            candidates.flatMap((task) => (isRootTask(task) ? [] : [task.ownerKey])),
+          );
+          subagentSessionKeys = new Set(
+            candidates.flatMap((task) =>
+              task.runtime === "subagent" && task.childSessionKey ? [task.childSessionKey] : [],
+            ),
+          );
+          return readTaskTree(
+            candidates,
+            current.allowedOwnerKeys,
+            current.controllerAgentId,
+            current.cfg,
+            "visible",
+          ).tasks;
+        };
+        const taskChangeAffectsRead = (event?: TaskRegistryObserverEvent) => {
+          if (!event || event.kind === "restored") {
+            return true;
+          }
+          const taskId = event.kind === "upserted" ? event.task.taskId : event.taskId;
+          return (
+            dependencies.has(taskId) ||
+            [event.previous, event.kind === "upserted" ? event.task : undefined].some(
+              (task) => task?.childSessionKey && ancestorSessionKeys.has(task.childSessionKey),
+            )
+          );
+        };
         const result = await waitForSelectedTasks({
           taskIds,
-          readTasks: readTreeTasks,
+          readTasks: readSelectedTasks,
+          taskChangeAffectsRead,
+          subagentChangeAffectsRead: (keys) =>
+            !keys?.length || keys.some((key) => key !== undefined && subagentSessionKeys.has(key)),
           timeoutMs: timeoutSeconds * 1_000,
           signal,
         });
         return jsonResult({ status: "ok", action, ...result });
       }
       const { cfg, controller, controllerAgentId, allowedOwnerKeys } = readScope();
-      const treeTasks = listTreeTasks(
-        (opts.listTasks ?? listTaskRecordsUnsorted)(),
+      const treeTasks = readTaskTree(
+        listTasks(allowedOwnerKeys),
         allowedOwnerKeys,
         controllerAgentId,
         cfg,
-      );
+        action === "cancel" ? "controlled" : "retained",
+      ).tasks;
 
       if (action === "list") {
         const runs = listControlledSubagentRuns(
@@ -387,7 +539,11 @@ export function createSubagentsTool(opts: SubagentsToolOptions = {}): AnyAgentTo
             error: "Leaf subagents cannot cancel other sessions.",
           });
         }
-        const result = await (opts.cancelTask ?? cancelDetachedTaskRunById)({ cfg, taskId });
+        const result = await withTaskCancellationContext(
+          assertCancellationControl,
+          () => (opts.cancelTask ?? cancelDetachedTaskRunById)({ cfg, taskId }),
+          target,
+        );
         return jsonResult({
           status: result.cancelled ? "cancelled" : "error",
           taskId,
