@@ -18,7 +18,6 @@ import {
   type ExecApprovalUsageAuthorization,
   resolveExecApprovalAllowedDecisions,
   buildEnforcedShellCommand,
-  evaluateShellAllowlistWithAuthorization,
   hasDurableExecApproval,
   hasExactCommandDurableExecApproval,
   minSecurity,
@@ -69,6 +68,7 @@ import {
   registerExecApprovalRequestForHostOrThrow,
 } from "./bash-tools.exec-approval-request.js";
 import { prepareCronStandingGrantConsumption } from "./bash-tools.exec-cron-grant.js";
+import { evaluateGatewayShellAllowlist } from "./bash-tools.exec-host-gateway-allowlist.js";
 import type {
   ProcessGatewayAllowlistParams,
   ProcessGatewayAllowlistResult,
@@ -405,16 +405,11 @@ export async function processGatewayAllowlist(
     agentId: params.agentId,
   });
   const fallbackSecurity = minSecurity(hostSecurity, askFallback);
-  const allowlistEval = await evaluateShellAllowlistWithAuthorization({
-    command: params.command,
-    allowlist: approvals.allowlist,
-    safeBins: params.safeBins,
-    safeBinProfiles: params.safeBinProfiles,
-    cwd: params.workdir,
-    env: params.env,
-    platform: process.platform,
-    trustedSafeBinDirs: params.trustedSafeBinDirs,
-  });
+  const allowlistEval = await evaluateGatewayShellAllowlist(
+    params,
+    approvals.allowlist,
+    evaluationPolicySnapshot.autoAllowSkills,
+  );
   const allowlistMatches = allowlistEval.allowlistMatches;
   const analysisOk = allowlistEval.analysisOk;
   const allowlistSatisfied =
