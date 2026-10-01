@@ -4,7 +4,10 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   evaluateShellAllowlistWithAuthorization,
+  isSegmentAuthorizedBySkillBins,
   type ExecAllowlistEntry,
+  type ExecCommandSegment,
+  type ExecSegmentSatisfiedBy,
   type SkillBinTrustEntry,
 } from "../infra/exec-approvals.js";
 import { resolveSkillBinTrustEntries } from "../node-host/runtime-skill-bins.js";
@@ -12,17 +15,21 @@ import { collectSkillBins } from "../skills/discovery/bins.js";
 import { resolveWorkspaceSkillPromptEntries } from "../skills/loading/workspace-skill-loader.js";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "./agent-scope-config.js";
 import type { ProcessGatewayAllowlistParams } from "./bash-tools.exec-host-gateway.types.js";
+import type { ExecSkillScope } from "./bash-tools.exec-types.js";
 
 /**
- * Skill bins for gateway-host autoAllowSkills: only the executing agent's eligible skills (the set
- * its prompt sees: enabled, allowed, requirements met), never every installed skill, resolved on the
- * PATH the command itself resolves on, as the node host resolves `skills.bins`. That PATH is the
- * Gateway's plus operator `pathPrepend`: host exec rejects a requested PATH, so a tool call cannot
- * point a skill bin name at another binary. Fails closed to no bins.
+ * Skill bins for gateway-host autoAllowSkills: only the skills eligible for the admitted run (the
+ * set its prompt sees: enabled, allowed, requirements met, then narrowed by the session's own skill
+ * filter and overrides), never every installed skill, resolved on the PATH the command itself
+ * resolves on, as the node host resolves `skills.bins`. That PATH is the Gateway's plus operator
+ * `pathPrepend`: host exec rejects a requested PATH, so a tool call cannot point a skill bin name at
+ * another binary. A session that excludes a skill therefore cannot borrow its binaries. Fails closed
+ * to no bins.
  */
 async function resolveGatewaySkillBins(params: {
   config?: OpenClawConfig;
   agentId?: string;
+  skillScope?: ExecSkillScope;
   env: Record<string, string>;
 }): Promise<SkillBinTrustEntry[]> {
   if (!params.config) {
@@ -32,7 +39,16 @@ async function resolveGatewaySkillBins(params: {
     const agentId = params.agentId ?? resolveDefaultAgentId(params.config);
     const { eligible } = await resolveWorkspaceSkillPromptEntries(
       resolveAgentWorkspaceDir(params.config, agentId),
-      { config: params.config, agentId },
+      {
+        config: params.config,
+        agentId,
+        // The run's admitted scope, not a fresh agent-config-only projection: the session's
+        // filter and overrides must bound which skills can authorize a host binary.
+        ...(params.skillScope?.skillFilter ? { skillFilter: params.skillScope.skillFilter } : {}),
+        ...(params.skillScope?.skillOverrides
+          ? { skillOverrides: params.skillScope.skillOverrides }
+          : {}),
+      },
     );
     return resolveSkillBinTrustEntries(
       collectSkillBins(eligible),
@@ -53,6 +69,7 @@ export async function evaluateGatewayShellAllowlist(
     ? await resolveGatewaySkillBins({
         config: params.config,
         agentId: params.agentId,
+        skillScope: params.skillScope,
         env: params.env,
       })
     : [];
@@ -68,4 +85,36 @@ export async function evaluateGatewayShellAllowlist(
     skillBins,
     autoAllowSkills,
   });
+}
+
+/**
+ * Re-resolves skill-bin authority after the policy commit and reports the first segment that skill
+ * trust no longer covers. The approvals file records only the `autoAllowSkills` flag, never which
+ * skill or executable authorized the command, so the committed `requireAutoAllowSkills` recheck
+ * cannot see the trusted name being repointed at a different executable while approval settles.
+ * Re-resolving closes that window before the process can perform any I/O. Fails closed: a scope
+ * that no longer resolves yields no bins, which denies.
+ */
+export async function findRevokedGatewaySkillBinSegment(params: {
+  allowlistParams: ProcessGatewayAllowlistParams;
+  segments: readonly ExecCommandSegment[];
+  segmentSatisfiedBy: readonly ExecSegmentSatisfiedBy[];
+  autoAllowSkills: boolean;
+}): Promise<ExecCommandSegment | undefined> {
+  const skillSegments = params.segments.filter(
+    (_segment, index) => params.segmentSatisfiedBy[index] === "skills",
+  );
+  if (skillSegments.length === 0) {
+    return undefined;
+  }
+  if (!params.autoAllowSkills) {
+    return skillSegments[0];
+  }
+  const skillBins = await resolveGatewaySkillBins({
+    config: params.allowlistParams.config,
+    agentId: params.allowlistParams.agentId,
+    skillScope: params.allowlistParams.skillScope,
+    env: params.allowlistParams.env,
+  });
+  return skillSegments.find((segment) => !isSegmentAuthorizedBySkillBins({ segment, skillBins }));
 }
