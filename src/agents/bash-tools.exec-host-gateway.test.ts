@@ -2879,6 +2879,68 @@ EOF`,
     expect(requireSentFollowupText(0)).toContain("done");
   });
 
+  // Detached approval settles long after evaluation, and its launch callback used to recheck only
+  // cwd/operand drift. A skill-authorized command must not reach spawn once that skill no longer
+  // grants the binary: assertCurrent revisits the policy flag, never current skill trust.
+  it("revalidates skill authority in the detached approval launch", async () => {
+    const { command } = { command: "node --version" };
+    await configurePlanBackedCommand({
+      command,
+      segmentSatisfiedBy: ["skills"],
+      allowlistSatisfied: true,
+      hostAsk: "always",
+      askFallback: "deny",
+    });
+    // autoAllowSkills is on, so the recheck re-resolves bins instead of short-circuiting; no
+    // workspace config is configured here, so current skill trust resolves to nothing.
+    resolveExecHostApprovalContextMock.mockReturnValue({
+      approvals: {
+        allowlist: [],
+        file: { version: 1, agents: { main: { autoAllowSkills: true } } },
+      },
+      hostSecurity: "allowlist",
+      hostAsk: "always",
+      askFallback: "deny",
+    });
+    mockApprovedDetachedExec({
+      outcome: { status: "completed", exitCode: 0, timedOut: false, aggregated: "ran" },
+    });
+    // Mirror the real runtime: the launch adapter calls beforeSpawn and propagates its refusal.
+    let spawnReached = false;
+    runExecProcessMock.mockImplementation(async (options: Record<string, unknown>) => {
+      const beforeSpawn = options.beforeSpawn as
+        | (() => Promise<{ details?: unknown } | undefined>)
+        | undefined;
+      await beforeSpawn?.();
+      spawnReached = true;
+      return {
+        session: { id: "sess-skill-revoked" },
+        promise: Promise.resolve({
+          status: "completed",
+          exitCode: 0,
+          timedOut: false,
+          aggregated: "ran",
+        }),
+      };
+    });
+
+    const result = await runGatewayAllowlist({
+      command,
+      agentId: "main",
+      approvalFollowupMode: "agent",
+      turnSourceChannel: "webchat",
+    });
+
+    expect(result.pendingResult?.details.status).toBe("approval-pending");
+    await vi.waitFor(() => {
+      expect(sendExecApprovalFollowupResultMock).toHaveBeenCalledTimes(1);
+    });
+    expect(sendExecApprovalFollowupResultMock.mock.calls[0]?.[1]).toContain(
+      "skill bin authorization changed before execution",
+    );
+    expect(spawnReached).toBe(false);
+  });
+
   it("keeps a completed detached outcome terminal when agent follow-up registration fails", async () => {
     const unhandledRejections = captureProcessUnhandledRejections();
     const completedOutcome = {

@@ -460,17 +460,23 @@ export async function processGatewayAllowlist(
   // The approvals file records the autoAllowSkills flag but never the executable a skill
   // authorized, so the committed-policy recheck cannot see that binary change while approval
   // settled. Re-resolve the authorizing skill bins at the spawn boundary.
-  const revalidateSkillBinAuthority = allowlistEval.segmentSatisfiedBy.includes("skills")
-    ? async (): Promise<AgentToolResult<ExecToolDetails> | undefined> => {
+  const resolveSkillBinAuthorityDrift = allowlistEval.segmentSatisfiedBy.includes("skills")
+    ? async (): Promise<string | undefined> => {
         const revoked = await findRevokedGatewaySkillBinSegment({
           allowlistParams: params,
           segments: allowlistEval.segments,
           segmentSatisfiedBy: allowlistEval.segmentSatisfiedBy,
           autoAllowSkills: evaluationPolicySnapshot.autoAllowSkills,
         });
-        return revoked
+        return revoked ? SKILL_BIN_AUTHORITY_REVOKED_DENIED_MESSAGE : undefined;
+      }
+    : undefined;
+  const revalidateSkillBinAuthority = resolveSkillBinAuthorityDrift
+    ? async (): Promise<AgentToolResult<ExecToolDetails> | undefined> => {
+        const deniedReason = await resolveSkillBinAuthorityDrift();
+        return deniedReason
           ? buildGatewayExecApprovalDeniedToolResult({
-              deniedReason: SKILL_BIN_AUTHORITY_REVOKED_DENIED_MESSAGE,
+              deniedReason,
               command: params.command,
               cwd: params.workdir,
             })
@@ -1545,11 +1551,15 @@ export async function processGatewayAllowlist(
               startupSignal: params.signal,
               assertCurrent,
               beforeSpawn: async () => {
-                finalBindingDenied = await resolveGatewayExecApprovalDrift({
-                  binding: approvalMutableFileBinding,
-                  cwdSnapshot: approvedCwdSnapshot,
-                  cwd: params.workdir,
-                });
+                // Detached approval can settle long after evaluation, so this launch needs the
+                // same skill-authority recheck as the inline paths: assertCurrent only revisits
+                // the policy flag, never which executable a skill currently authorizes.
+                finalBindingDenied =
+                  (await resolveGatewayExecApprovalDrift({
+                    binding: approvalMutableFileBinding,
+                    cwdSnapshot: approvedCwdSnapshot,
+                    cwd: params.workdir,
+                  })) ?? (await resolveSkillBinAuthorityDrift?.());
                 if (finalBindingDenied) {
                   throw finalBindingDeniedError;
                 }
