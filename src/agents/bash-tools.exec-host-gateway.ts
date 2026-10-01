@@ -73,7 +73,10 @@ import {
   buildExecApprovalTurnSourceContext,
   registerExecApprovalRequestForHostOrThrow,
 } from "./bash-tools.exec-approval-request.js";
-import { evaluateGatewayShellAllowlist } from "./bash-tools.exec-host-gateway-allowlist.js";
+import {
+  evaluateGatewayShellAllowlist,
+  findRevokedGatewaySkillBinSegment,
+} from "./bash-tools.exec-host-gateway-allowlist.js";
 import type {
   ProcessGatewayAllowlistParams,
   ProcessGatewayAllowlistResult,
@@ -391,6 +394,31 @@ async function resolveGatewayExecApprovalFollowupText(params: {
   }
 }
 
+const SKILL_BIN_AUTHORITY_REVOKED_DENIED_MESSAGE =
+  "SYSTEM_RUN_DENIED: skill bin authorization changed before execution";
+
+/** Runs spawn-boundary rechecks in order and returns the first denial. */
+function chainRevalidations(
+  revalidations: Array<(() => Promise<AgentToolResult<ExecToolDetails> | undefined>) | undefined>,
+): (() => Promise<AgentToolResult<ExecToolDetails> | undefined>) | undefined {
+  const active = revalidations.filter(
+    (revalidate): revalidate is () => Promise<AgentToolResult<ExecToolDetails> | undefined> =>
+      Boolean(revalidate),
+  );
+  if (active.length === 0) {
+    return undefined;
+  }
+  return async () => {
+    for (const revalidate of active) {
+      const denied = await revalidate();
+      if (denied) {
+        return denied;
+      }
+    }
+    return undefined;
+  };
+}
+
 /** Processes gateway exec policy and returns execution/approval/denial outcome. */
 export async function processGatewayAllowlist(
   params: ProcessGatewayAllowlistParams,
@@ -429,6 +457,26 @@ export async function processGatewayAllowlist(
   );
   const allowlistMatches = allowlistEval.allowlistMatches;
   const analysisOk = allowlistEval.analysisOk;
+  // The approvals file records the autoAllowSkills flag but never the executable a skill
+  // authorized, so the committed-policy recheck cannot see that binary change while approval
+  // settled. Re-resolve the authorizing skill bins at the spawn boundary.
+  const revalidateSkillBinAuthority = allowlistEval.segmentSatisfiedBy.includes("skills")
+    ? async (): Promise<AgentToolResult<ExecToolDetails> | undefined> => {
+        const revoked = await findRevokedGatewaySkillBinSegment({
+          allowlistParams: params,
+          segments: allowlistEval.segments,
+          segmentSatisfiedBy: allowlistEval.segmentSatisfiedBy,
+          autoAllowSkills: evaluationPolicySnapshot.autoAllowSkills,
+        });
+        return revoked
+          ? buildGatewayExecApprovalDeniedToolResult({
+              deniedReason: SKILL_BIN_AUTHORITY_REVOKED_DENIED_MESSAGE,
+              command: params.command,
+              cwd: params.workdir,
+            })
+          : undefined;
+      }
+    : undefined;
   const allowlistSatisfied =
     hostSecurity === "allowlist" && analysisOk ? allowlistEval.allowlistSatisfied : false;
   const obsoleteGeneratedApprovalCount = countObsoleteGeneratedExecApprovals(approvals.file);
@@ -916,7 +964,7 @@ export async function processGatewayAllowlist(
       };
     }
     const approvalMutableFileBinding = mutableFileBinding;
-    const revalidateBeforeExecution =
+    const revalidateBeforeExecution = chainRevalidations([
       approvedCwdSnapshot || approvalMutableFileBinding.operands.length > 0
         ? () =>
             revalidateGatewayExecApprovalBinding({
@@ -925,7 +973,9 @@ export async function processGatewayAllowlist(
               command: params.command,
               cwd: params.workdir,
             })
-        : undefined;
+        : undefined,
+      revalidateSkillBinAuthority,
+    ]);
     const authorizationCandidates = allowlistEval.authorizationPlan?.ok
       ? allowlistEval.authorizationPlan.groups.flatMap((group) => group.candidates)
       : [];
@@ -1619,19 +1669,21 @@ export async function processGatewayAllowlist(
     ),
   });
 
+  const revalidateBeforeExecution = chainRevalidations([
+    approvedCwdSnapshot
+      ? () =>
+          revalidateGatewayExecApprovalBinding({
+            cwdSnapshot: approvedCwdSnapshot,
+            command: params.command,
+            cwd: params.workdir,
+          })
+      : undefined,
+    revalidateSkillBinAuthority,
+  ]);
   return {
     execCommandOverride: enforcedCommand,
     assertCurrent,
-    ...(approvedCwdSnapshot
-      ? {
-          revalidateBeforeExecution: () =>
-            revalidateGatewayExecApprovalBinding({
-              cwdSnapshot: approvedCwdSnapshot,
-              command: params.command,
-              cwd: params.workdir,
-            }),
-        }
-      : {}),
+    ...(revalidateBeforeExecution ? { revalidateBeforeExecution } : {}),
   };
 }
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

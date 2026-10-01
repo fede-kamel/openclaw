@@ -287,6 +287,22 @@ function isSkillAutoAllowedSegment(params: {
   return Boolean(params.skillBinTrust.get(executableName)?.has(resolvedPath));
 }
 
+/**
+ * Whether a segment's resolved executable is trusted by these skill bins, using the same
+ * identity comparison the allowlist evaluation applies. Shared so a caller revalidating skill
+ * authority before launch cannot drift from the check that granted it.
+ */
+export function isSegmentAuthorizedBySkillBins(params: {
+  segment: ExecCommandSegment;
+  skillBins: readonly SkillBinTrustEntry[];
+}): boolean {
+  return isSkillAutoAllowedSegment({
+    segment: params.segment,
+    allowSkills: params.skillBins.length > 0,
+    skillBinTrust: buildSkillBinTrustIndex(params.skillBins),
+  });
+}
+
 const MAX_SHELL_WRAPPER_INLINE_EVAL_DEPTH = 3;
 
 type InlineChainAllowlistEvaluation = {

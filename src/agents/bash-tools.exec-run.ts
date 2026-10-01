@@ -516,6 +516,7 @@ export function createExecTool(
             trigger: defaults?.trigger,
             agentId,
             config: defaults?.config,
+            skillScope: defaults?.skillScope,
             sessionKey: defaults?.sessionKey,
             runId: defaults?.runId,
             toolCallId,

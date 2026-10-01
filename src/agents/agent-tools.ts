@@ -338,6 +338,20 @@ export function createOpenClawCodingToolsInternal(
       ...execDefaults,
       ...effectiveExecPolicy,
       config: execRuntimeConfig,
+      // Skill-bin trust under autoAllowSkills must follow the run's admitted skill scope, so a
+      // session filter or override that excludes a skill also withdraws its binaries.
+      ...(options?.skillsSnapshot
+        ? {
+            skillScope: {
+              ...(options.skillsSnapshot.skillFilter
+                ? { skillFilter: options.skillsSnapshot.skillFilter }
+                : {}),
+              ...(options.skillsSnapshot.skillOverrides
+                ? { skillOverrides: options.skillsSnapshot.skillOverrides }
+                : {}),
+            },
+          }
+        : {}),
       preparedRunEnvironment,
       reviewer: options?.exec?.reviewer ?? execConfig.reviewer,
       reviewTranscript: options?.exec?.reviewTranscript,

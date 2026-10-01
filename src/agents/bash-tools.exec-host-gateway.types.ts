@@ -6,6 +6,7 @@ import type { SecretEgressSentinelBinding } from "../secrets/egress-proxy/proxy-
 import type {
   ExecElevatedDefaults,
   ExecApprovalFollowupFactory,
+  ExecSkillScope,
   ExecToolApprovalReview,
   ExecToolDetails,
 } from "./bash-tools.exec-types.js";
@@ -64,6 +65,8 @@ export type ProcessGatewayAllowlistParams = {
   trustedSafeBinDirs?: ReadonlySet<string>;
   /** Runtime config used to resolve the agent's skill bins for autoAllowSkills. */
   config?: OpenClawConfig;
+  /** Admitted run's skill scope, so autoAllowSkills trusts only its eligible skills' bins. */
+  skillScope?: ExecSkillScope;
 };
 
 /** Gateway allowlist outcome before command execution continues. */

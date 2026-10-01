@@ -2385,6 +2385,7 @@ Command: ${command}`;
       allowlistSatisfied: false,
       segments: [],
       segmentAllowlistEntries: [],
+      segmentSatisfiedBy: [],
     });
     resolveExecHostApprovalContextMock.mockReturnValue({
       approvals: { allowlist: [], file: { version: 1, agents: {} } },
@@ -2429,6 +2430,7 @@ Command: ${command}`;
       allowlistSatisfied: false,
       segments: [{ resolution: null, argv: ["echo", "ok"] }],
       segmentAllowlistEntries: [],
+      segmentSatisfiedBy: [],
     });
     defaultExecAutoReviewerMock.mockResolvedValue({
       decision: "ask",
@@ -2601,6 +2603,7 @@ Command: ${command}`;
         },
       ],
       segmentAllowlistEntries: [],
+      segmentSatisfiedBy: [],
     });
     resolveExecHostApprovalContextMock.mockReturnValue({
       approvals: { allowlist: [], file: { version: 1, agents: {} } },
@@ -2629,6 +2632,7 @@ Command: ${command}`;
         { resolution: null, argv: ["openclaw", "config", "get", "security.audit.suppressions"] },
       ],
       segmentAllowlistEntries: [],
+      segmentSatisfiedBy: [],
     });
     resolveExecHostApprovalContextMock.mockReturnValue({
       approvals: { allowlist: [], file: { version: 1, agents: {} } },
@@ -2666,6 +2670,7 @@ Command: ${command}`;
         },
       ],
       segmentAllowlistEntries: [],
+      segmentSatisfiedBy: [],
     });
     resolveExecHostApprovalContextMock.mockReturnValue({
       approvals: { allowlist: [], file: { version: 1, agents: {} } },
@@ -2737,6 +2742,7 @@ EOF`,
       allowlistSatisfied: false,
       segments: [{ resolution: null, argv: ["node", "--version"] }],
       segmentAllowlistEntries: [],
+      segmentSatisfiedBy: [],
     });
     hasDurableExecApprovalMock.mockReturnValue(false);
 

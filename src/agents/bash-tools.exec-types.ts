@@ -61,6 +61,18 @@ export type ExecProcessOutcome =
       reason: string;
     };
 
+/**
+ * The admitted run's skill narrowing, carried from its skill snapshot. Bounds which skills may
+ * authorize a host binary under `autoAllowSkills`, so a session that excluded a skill cannot
+ * borrow the binaries it declares.
+ */
+export type ExecSkillScope = {
+  /** Normalized agent-level filter used to build the run's snapshot; undefined means unrestricted. */
+  skillFilter?: string[];
+  /** Sparse per-session overlay applied after the agent-level filter. */
+  skillOverrides?: Record<string, boolean>;
+};
+
 /** Runtime defaults passed into exec/process tool factories. */
 export type ExecToolDefaults = {
   hasCronTool?: boolean;
@@ -81,6 +93,8 @@ export type ExecToolDefaults = {
   safeBinProfiles?: Record<string, SafeBinProfileFixture>;
   reviewer?: ExecReviewerConfig;
   config?: OpenClawConfig;
+  /** Admitted run's skill scope for autoAllowSkills bin trust. */
+  skillScope?: ExecSkillScope;
   /** Host-prepared non-secret environment and store projection exclusions. */
   preparedRunEnvironment?: PreparedGitHubToolEnvironment;
   autoReviewer?: ExecAutoReviewer;
