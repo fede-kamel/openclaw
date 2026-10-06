@@ -13,34 +13,36 @@ import { CONFIG_PATH } from "../config/config.js";
 import { INCLUDE_KEY } from "../config/includes.js";
 import { logConfigWarningsOnce } from "../config/io.warnings.js";
 import { formatConfigIssueLines } from "../config/issue-format.js";
-import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
+import type {
+  ConfigFileSnapshot,
+  ConfigValidationIssue,
+  OpenClawConfig,
+} from "../config/types.openclaw.js";
 import { OpenClawSchema } from "../config/zod-schema.js";
 import { isPathInside } from "../infra/path-guards.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import { resolveCliModelEntry } from "../media-understanding/resolve.js";
+import { collectMediaCliModelIssues } from "../media-understanding/cli-model-entry.js";
 import { isRecord } from "../utils.js";
 import { sanitizeDoctorNote } from "./doctor/emit-notes.js";
 
 const configLog = createSubsystemLogger("config");
 
-export function noteMediaCliModelWarnings(cfg: OpenClawConfig): void {
-  const models = cfg.tools?.media?.models;
-  if (!Array.isArray(models)) {
-    return;
-  }
-  const warnings: string[] = [];
-  models.forEach((entry, index) => {
-    if (!entry || (entry.type ?? (entry.command ? "cli" : "provider")) !== "cli") {
-      return;
-    }
-    const resolved = resolveCliModelEntry(entry);
-    if (!resolved.ok) {
-      const field = resolved.error.reason === "cli-missing-command" ? "command" : "args";
-      warnings.push(
-        `- tools.media.models[${index}].${field}: Invalid CLI media model. ${resolved.error.message} Doctor cannot choose a command or attachment arguments; edit this entry.`,
-      );
-    }
-  });
+/**
+ * Reports CLI media models that cannot run. Entries already shown through the
+ * config snapshot's validation warnings are skipped so each problem is reported
+ * once; this note still covers runs whose snapshot skipped plugin validation.
+ */
+export function noteMediaCliModelWarnings(
+  cfg: OpenClawConfig,
+  options?: { reportedWarnings?: readonly ConfigValidationIssue[] },
+): void {
+  const reported = new Set(options?.reportedWarnings?.map((warning) => warning.path));
+  const warnings = collectMediaCliModelIssues(cfg)
+    .filter((issue) => !reported.has(issue.path))
+    .map(
+      (issue) =>
+        `- tools.media.models[${issue.index}].${issue.field}: ${issue.message} Doctor cannot choose a command or attachment arguments; edit this entry.`,
+    );
   if (warnings.length > 0) {
     note(warnings.join("\n"), "Doctor warnings");
   }

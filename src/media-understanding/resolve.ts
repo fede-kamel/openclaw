@@ -4,8 +4,6 @@ import {
   MAX_TIMER_TIMEOUT_MS,
   resolveTimerTimeoutMs,
 } from "@openclaw/normalization-core/number-coercion";
-import { err, ok, type Result } from "@openclaw/normalization-core/result";
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { MsgContext } from "../auto-reply/templating.js";
 import type { OpenClawConfig } from "../config/types.js";
 import type {
@@ -30,42 +28,6 @@ export type ResolvedMediaModelEntry = {
   entry: MediaUnderstandingModelConfig;
   secretOwnerId?: string;
 };
-
-class MediaCliModelUnavailableError extends Error {
-  constructor(
-    readonly reason: "cli-missing-command" | "cli-missing-attachment-arg",
-    message: string,
-  ) {
-    super(`${reason}; ${message}`);
-  }
-}
-
-/** Resolve executable CLI inputs without making invalid media config startup-fatal. */
-export function resolveCliModelEntry(
-  entry: MediaUnderstandingModelConfig,
-): Result<{ command: string; args: string[] }, MediaCliModelUnavailableError> {
-  const command = normalizeOptionalString(entry.command);
-  if (!command) {
-    return err(
-      new MediaCliModelUnavailableError(
-        "cli-missing-command",
-        'Set command to the media executable and args to pass the attachment, for example ["{{AttachmentPath}}"].',
-      ),
-    );
-  }
-  const args = entry.args;
-  // No stdin is supplied, so empty args cannot carry the attachment. Nonempty
-  // literal/custom argv is a shipped command contract; interpolation is optional.
-  if (!Array.isArray(args) || args.length === 0) {
-    return err(
-      new MediaCliModelUnavailableError(
-        "cli-missing-attachment-arg",
-        'Set args to pass the attachment, for example ["{{AttachmentPath}}"]. CLI stdin is not supplied.',
-      ),
-    );
-  }
-  return ok({ command, args });
-}
 
 /** Default per-provider media-understanding runtime timeout in milliseconds. */
 const DEFAULT_MEDIA_RUNTIME_TIMEOUT_MS = 30_000;

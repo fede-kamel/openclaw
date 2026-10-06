@@ -607,7 +607,7 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
   noteImplicitFallbackClobberWarnings(cfg);
   noteSandboxOriginProxyWarning(cfg);
   noteMcpOriginWarning(cfg);
-  noteMediaCliModelWarnings(cfg);
+  noteMediaCliModelWarnings(cfg, { reportedWarnings: snapshot.warnings });
   noteMissingDefaultAgentOwner(cfg);
 
   const migrationResult = await finalizeMigrationResult({

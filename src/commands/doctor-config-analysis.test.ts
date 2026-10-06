@@ -8,6 +8,7 @@ import {
   noteDoctorHookConfigWarnings,
   noteImplicitFallbackClobberWarnings,
   noteMcpOriginWarning,
+  noteMediaCliModelWarnings,
   noteMissingDefaultAgentOwner,
   noteOpencodeProviderOverrides,
   noteSandboxOriginProxyWarning,
@@ -53,6 +54,43 @@ describe("doctor config analysis helpers", () => {
     expect(warning).toContain("/virtual/.openclaw/workspace/skills/linear-webhook");
     expect(warning).toContain("/virtual/.openclaw/hooks/transforms");
     expect(warning).toContain("move custom transforms there or remove hooks.transformsDir");
+  });
+
+  it("reports each invalid CLI media model once alongside config validation warnings", () => {
+    const cfg = {
+      tools: {
+        media: {
+          models: [
+            { type: "cli", capabilities: ["audio"] },
+            { type: "cli", command: "fixture-transcribe", capabilities: ["audio"] },
+          ],
+        },
+      },
+    } as OpenClawConfig;
+
+    noteMock.mockClear();
+    noteMediaCliModelWarnings(cfg);
+    const standalone = String(noteMock.mock.calls.at(-1)?.[0]);
+    expect(standalone).toContain("tools.media.models[0].command");
+    expect(standalone).toContain("tools.media.models[1].args");
+
+    // Config validation already reported entry 0, so Doctor reports only entry 1.
+    noteMock.mockClear();
+    noteMediaCliModelWarnings(cfg, {
+      reportedWarnings: [{ path: "tools.media.models.0.command", message: "already shown" }],
+    });
+    const deduped = String(noteMock.mock.calls.at(-1)?.[0]);
+    expect(deduped).not.toContain("tools.media.models[0]");
+    expect(deduped).toContain("tools.media.models[1].args");
+
+    noteMock.mockClear();
+    noteMediaCliModelWarnings(cfg, {
+      reportedWarnings: [
+        { path: "tools.media.models.0.command", message: "already shown" },
+        { path: "tools.media.models.1.args", message: "already shown" },
+      ],
+    });
+    expect(noteMock).not.toHaveBeenCalled();
   });
 
   it("requires a durable default designation despite retained migration provenance", () => {
