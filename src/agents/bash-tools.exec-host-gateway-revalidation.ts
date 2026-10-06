@@ -1,5 +1,6 @@
 // Spawn-boundary rechecks for gateway-host exec: approval-binding drift and skill-bin authority,
-// each turned into the denial the launch reports instead of spawning.
+// each turned into the denial the launch reports instead of spawning. Skill authority is also held
+// through native initiation.
 import type { ExecCommandSegment, ExecSegmentSatisfiedBy } from "../infra/exec-approvals.js";
 import {
   revalidateSystemRunMutableFileBinding,
@@ -10,8 +11,13 @@ import {
   type ApprovedCwdSnapshot,
   revalidateApprovedCwdSnapshot,
 } from "../infra/system-run-cwd-binding.js";
-import { findRevokedGatewaySkillBinSegment } from "./bash-tools.exec-host-gateway-allowlist.js";
+import {
+  findStaleHeldGatewaySkillBinSegment,
+  type HeldGatewaySkillBinAuthority,
+  verifyGatewaySkillBinAuthority,
+} from "./bash-tools.exec-host-gateway-allowlist.js";
 import type { ProcessGatewayAllowlistParams } from "./bash-tools.exec-host-gateway.types.js";
+import { ExecProcessPreflightError } from "./bash-tools.exec-launch.js";
 import type { ExecToolDetails } from "./bash-tools.exec-types.js";
 import type { AgentToolResult } from "./runtime/index.js";
 
@@ -102,11 +108,19 @@ export function chainRevalidations(
   };
 }
 
+/** Final-initiation denial that carries the skill-authority reason to the detached follow-up. */
+export class GatewaySkillBinAuthorityWithdrawnError extends ExecProcessPreflightError {
+  readonly deniedReason = SKILL_BIN_AUTHORITY_REVOKED_DENIED_MESSAGE;
+}
+
 /**
  * Spawn-boundary recheck of skill-bin authority. The approvals file records the autoAllowSkills
  * flag but never the executable a skill authorized, so the committed-policy recheck cannot see
  * that binary change while approval settles; this re-resolves the authorizing skill bins instead.
- * Both members are undefined when no segment was admitted on skill trust.
+ * The async members re-resolve before launch preparation; `assertSkillBinAuthorityCurrent` rechecks
+ * the authority they verified synchronously at native initiation, since standing-grant consumption,
+ * secret-egress registration, the supervisor scope fence and adapter preparation all await after
+ * them. All members are undefined when no segment was admitted on skill trust.
  */
 export function createGatewaySkillBinAuthorityRecheck(params: {
   allowlistParams: ProcessGatewayAllowlistParams;
@@ -117,23 +131,38 @@ export function createGatewaySkillBinAuthorityRecheck(params: {
 }) {
   // Only a command that analyzed cleanly can have segments admitted on skill trust.
   if (!params.analysisOk || !params.segmentSatisfiedBy.includes("skills")) {
-    return { resolveSkillBinAuthorityDrift: undefined, revalidateSkillBinAuthority: undefined };
+    return {
+      resolveSkillBinAuthorityDrift: undefined,
+      revalidateSkillBinAuthority: undefined,
+      assertSkillBinAuthorityCurrent: undefined,
+    };
   }
-  const resolveSkillBinAuthorityDrift = async (): Promise<string | undefined> =>
-    (await findRevokedGatewaySkillBinSegment(params))
-      ? SKILL_BIN_AUTHORITY_REVOKED_DENIED_MESSAGE
-      : undefined;
+  // Nothing is held until a re-resolution verifies trust, so initiation without one denies.
+  let held: HeldGatewaySkillBinAuthority | undefined;
+  const resolveSkillBinAuthorityDrift = async (): Promise<string | undefined> => {
+    held = undefined;
+    const verified = await verifyGatewaySkillBinAuthority(params);
+    held = verified.held;
+    return verified.revoked ? SKILL_BIN_AUTHORITY_REVOKED_DENIED_MESSAGE : undefined;
+  };
+  const buildDenied = () =>
+    buildGatewayExecApprovalDeniedToolResult({
+      deniedReason: SKILL_BIN_AUTHORITY_REVOKED_DENIED_MESSAGE,
+      command: params.allowlistParams.command,
+      cwd: params.allowlistParams.workdir,
+    });
   const revalidateSkillBinAuthority = async (): Promise<
     AgentToolResult<ExecToolDetails> | undefined
-  > => {
-    const deniedReason = await resolveSkillBinAuthorityDrift();
-    return deniedReason
-      ? buildGatewayExecApprovalDeniedToolResult({
-          deniedReason,
-          command: params.allowlistParams.command,
-          cwd: params.allowlistParams.workdir,
-        })
-      : undefined;
+  > => ((await resolveSkillBinAuthorityDrift()) ? buildDenied() : undefined);
+  const assertSkillBinAuthorityCurrent = () => {
+    if (findStaleHeldGatewaySkillBinSegment({ ...params, held })) {
+      held = undefined;
+      throw new GatewaySkillBinAuthorityWithdrawnError(buildDenied());
+    }
   };
-  return { resolveSkillBinAuthorityDrift, revalidateSkillBinAuthority };
+  return {
+    resolveSkillBinAuthorityDrift,
+    revalidateSkillBinAuthority,
+    assertSkillBinAuthorityCurrent,
+  };
 }

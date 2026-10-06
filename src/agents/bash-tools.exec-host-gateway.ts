@@ -67,6 +67,7 @@ import {
   buildGatewayExecApprovalDeniedToolResult,
   chainRevalidations,
   createGatewaySkillBinAuthorityRecheck,
+  GatewaySkillBinAuthorityWithdrawnError,
   resolveGatewayExecApprovalDrift,
   revalidateGatewayExecApprovalBinding,
 } from "./bash-tools.exec-host-gateway-revalidation.js";
@@ -351,14 +352,17 @@ export async function processGatewayAllowlist(
   );
   const allowlistMatches = allowlistEval.allowlistMatches;
   const analysisOk = allowlistEval.analysisOk;
-  const { resolveSkillBinAuthorityDrift, revalidateSkillBinAuthority } =
-    createGatewaySkillBinAuthorityRecheck({
-      allowlistParams: params,
-      analysisOk,
-      segments: allowlistEval.segments,
-      segmentSatisfiedBy: allowlistEval.segmentSatisfiedBy,
-      autoAllowSkills: evaluationPolicySnapshot.autoAllowSkills,
-    });
+  const {
+    resolveSkillBinAuthorityDrift,
+    revalidateSkillBinAuthority,
+    assertSkillBinAuthorityCurrent,
+  } = createGatewaySkillBinAuthorityRecheck({
+    allowlistParams: params,
+    analysisOk,
+    segments: allowlistEval.segments,
+    segmentSatisfiedBy: allowlistEval.segmentSatisfiedBy,
+    autoAllowSkills: evaluationPolicySnapshot.autoAllowSkills,
+  });
   const allowlistSatisfied =
     hostSecurity === "allowlist" && analysisOk ? allowlistEval.allowlistSatisfied : false;
   const obsoleteGeneratedApprovalCount = countObsoleteGeneratedExecApprovals(approvals.file);
@@ -522,6 +526,8 @@ export async function processGatewayAllowlist(
       throw new Error("Exec authorization has not been committed");
     }
     assertCommittedAuthorization();
+    // Committed policy never records skill trust; hold it through native initiation too.
+    assertSkillBinAuthorityCurrent?.();
   };
   const commitExecutionAuthorization = async (options: {
     source: ExecApprovalUsageAuthorization["source"];
@@ -736,7 +742,10 @@ export async function processGatewayAllowlist(
         });
       return {
         execCommandOverride: enforcedCommand,
-        assertCurrent: consumeGrant.assertCurrent,
+        assertCurrent: () => {
+          consumeGrant.assertCurrent();
+          assertSkillBinAuthorityCurrent?.();
+        },
         initiateSpawn: consumeGrant.initiateSpawn,
         releaseSpawn: consumeGrant.releaseSpawn,
         revalidateBeforeExecution: async () => {
@@ -1398,8 +1407,8 @@ export async function processGatewayAllowlist(
               assertCurrent,
               beforeSpawn: async () => {
                 // Detached approval can settle long after evaluation, so this launch needs the
-                // same skill-authority recheck as the inline paths: assertCurrent only revisits
-                // the policy flag, never which executable a skill currently authorizes.
+                // same skill-authority re-resolution as the inline paths; assertCurrent then
+                // holds the authority it verifies through native initiation.
                 finalBindingDenied =
                   (await resolveGatewayExecApprovalDrift({
                     binding: approvalMutableFileBinding,
@@ -1418,6 +1427,9 @@ export async function processGatewayAllowlist(
             }
             if (error === finalBindingDeniedError && finalBindingDenied) {
               return { status: "operand-drift" as const, message: finalBindingDenied };
+            }
+            if (error instanceof GatewaySkillBinAuthorityWithdrawnError) {
+              return { status: "operand-drift" as const, message: error.deniedReason };
             }
             return { status: "spawn-failed" as const };
           }

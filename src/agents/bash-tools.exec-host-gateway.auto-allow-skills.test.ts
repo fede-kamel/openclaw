@@ -163,6 +163,31 @@ describe.skipIf(process.platform === "win32")("gateway-host exec autoAllowSkills
     });
   }
 
+  // Uninstall the authorizing skill, as the skills watcher would observe it.
+  function uninstallSkillTool() {
+    const skillDir = path.join(workspace, "skills", "skill-tool");
+    fs.rmSync(skillDir, { recursive: true });
+    bumpSkillsSnapshotVersion({ workspaceDir: workspace, reason: "watch", changedPath: skillDir });
+  }
+
+  function mockDetachedAllowOnce(onDecision?: () => void) {
+    saveExecApprovals({
+      version: 1,
+      defaults: { security: "allowlist", ask: "always", askFallback: "deny" },
+      agents: { main: { autoAllowSkills: true, allowlist: [] } },
+    });
+    vi.mocked(callGatewayTool).mockImplementation(async (method: string) => {
+      if (method === "exec.approval.request") {
+        return { status: "accepted" };
+      }
+      if (method === "exec.approval.waitDecision") {
+        onDecision?.();
+        return { decision: "allow-once" };
+      }
+      throw new Error(`Unexpected Gateway method: ${method}`);
+    });
+  }
+
   // Repoint the trusted name at a different executable, as a skill upgrade or a planted
   // replacement would between authorization and spawn.
   function swapSkillBin() {
@@ -246,30 +271,7 @@ describe.skipIf(process.platform === "win32")("gateway-host exec autoAllowSkills
     { name: "launches when skill trust still holds", withdraw: false },
     { name: "denies before spawn when skill trust is withdrawn", withdraw: true },
   ])("detached approval launch $name", async ({ withdraw }) => {
-    saveExecApprovals({
-      version: 1,
-      defaults: { security: "allowlist", ask: "always", askFallback: "deny" },
-      agents: { main: { autoAllowSkills: true, allowlist: [] } },
-    });
-    vi.mocked(callGatewayTool).mockImplementation(async (method: string) => {
-      if (method === "exec.approval.request") {
-        return { status: "accepted" };
-      }
-      if (method === "exec.approval.waitDecision") {
-        if (withdraw) {
-          // Uninstall the authorizing skill, as the skills watcher would observe it.
-          const skillDir = path.join(workspace, "skills", "skill-tool");
-          fs.rmSync(skillDir, { recursive: true });
-          bumpSkillsSnapshotVersion({
-            workspaceDir: workspace,
-            reason: "watch",
-            changedPath: skillDir,
-          });
-        }
-        return { decision: "allow-once" };
-      }
-      throw new Error(`Unexpected Gateway method: ${method}`);
-    });
+    mockDetachedAllowOnce(withdraw ? uninstallSkillTool : undefined);
 
     const result = await runGatewayAllowlist("always", { approvalFollowupMode: "agent" });
 
@@ -283,6 +285,28 @@ describe.skipIf(process.platform === "win32")("gateway-host exec autoAllowSkills
       expect(followup).toContain("Exec finished");
       expect(spawn).toHaveBeenCalledOnce();
     }
+  });
+
+  // After the spawn preflight, the supervisor can still wait on a scope fence or adapter
+  // preparation. Trust withdrawn there must stop the detached launch at native initiation.
+  it("detached approval launch denies at native initiation when trust is withdrawn after preflight", async () => {
+    mockDetachedAllowOnce();
+    const launch = vi.fn();
+    spawn.mockImplementationOnce(async (input) => {
+      uninstallSkillTool();
+      input.initiateSpawn?.(launch);
+      throw new Error("native initiation was not refused");
+    });
+
+    const result = await runGatewayAllowlist("always", { approvalFollowupMode: "agent" });
+
+    expect(result.pendingResult?.details.status).toBe("approval-pending");
+    await vi.waitFor(() => expect(sendFollowup).toHaveBeenCalled(), { timeout: 10_000 });
+    expect(String(sendFollowup.mock.calls.at(-1)?.[1])).toContain(
+      "skill bin authorization changed before execution",
+    );
+    expect(spawn).toHaveBeenCalledOnce();
+    expect(launch).not.toHaveBeenCalled();
   });
 
   // Skill bins resolve on the command's PATH, which is safe only because host exec refuses a
