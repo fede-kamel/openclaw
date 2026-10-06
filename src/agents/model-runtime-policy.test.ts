@@ -437,6 +437,29 @@ describe("resolveModelRuntimePolicy", () => {
   });
 
   it.each([
+    { modelId: "qwen-local", expected: { policy: { id: "codex" }, source: "model" } },
+    { modelId: "local", expected: {} },
+  ])("matches self-qualified provider rows only by their full model id ($modelId)", (params) => {
+    const config = {
+      models: {
+        providers: {
+          vllm: {
+            baseUrl: "http://127.0.0.1:11434/v1",
+            models: [
+              createModelConfig("openclaw", "other/qwen-local"),
+              createModelConfig("codex", " vllm/qwen-local "),
+            ],
+          },
+        },
+      },
+    } as OpenClawConfig;
+
+    expect(
+      resolveModelRuntimePolicy({ config, provider: "vllm", modelId: params.modelId }),
+    ).toEqual(params.expected);
+  });
+
+  it.each([
     {
       name: "provider-owned model id",
       modelId: "anthropic/claude-opus-4.6",
