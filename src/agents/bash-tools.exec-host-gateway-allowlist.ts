@@ -1,7 +1,6 @@
 /**
  * Gateway-host exec allowlist evaluation, including skill bins for autoAllowSkills.
  */
-import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   evaluateShellAllowlistWithAuthorization,
   isSegmentAuthorizedBySkillBins,
@@ -16,7 +15,6 @@ import { resolveWorkspaceSkillPromptEntries } from "../skills/loading/workspace-
 import { getSkillsSourceVersion } from "../skills/runtime/refresh-state.js";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "./agent-scope-config.js";
 import type { ProcessGatewayAllowlistParams } from "./bash-tools.exec-host-gateway.types.js";
-import type { ExecSkillScope } from "./bash-tools.exec-types.js";
 
 type ResolvedGatewaySkillBins = {
   skillBins: SkillBinTrustEntry[];
@@ -31,21 +29,21 @@ type ResolvedGatewaySkillBins = {
  * filter and overrides), never every installed skill, resolved on the PATH the command itself
  * resolves on, as the node host resolves `skills.bins`. That PATH is the Gateway's plus operator
  * `pathPrepend`: host exec rejects a requested PATH, so a tool call cannot point a skill bin name at
- * another binary. A session that excludes a skill therefore cannot borrow its binaries. Fails closed
- * to no bins.
+ * another binary. A session that excludes a skill therefore cannot borrow its binaries. The skills
+ * are the executing agent's (`skillScope.ownerAgentId`), the agent the run's skill scope was
+ * admitted for: a run that borrows another agent's tool policy takes that agent's approvals, never
+ * its skills. Fails closed to no bins.
  */
-async function resolveGatewaySkillBins(params: {
-  config?: OpenClawConfig;
-  agentId?: string;
-  skillScope?: ExecSkillScope;
-  env: Record<string, string>;
-}): Promise<ResolvedGatewaySkillBins> {
+async function resolveGatewaySkillBins(
+  params: Pick<ProcessGatewayAllowlistParams, "config" | "agentId" | "skillScope" | "env">,
+): Promise<ResolvedGatewaySkillBins> {
   const pathEnv = params.env.PATH ?? process.env.PATH ?? "";
   if (!params.config) {
     return { skillBins: [], pathEnv };
   }
   try {
-    const agentId = params.agentId ?? resolveDefaultAgentId(params.config);
+    const agentId =
+      params.skillScope?.ownerAgentId ?? params.agentId ?? resolveDefaultAgentId(params.config);
     const workspaceDir = resolveAgentWorkspaceDir(params.config, agentId);
     // Read before discovery: a skill change that lands while discovery runs then leaves the
     // revision ahead of what was verified, and the final initiation check denies.
@@ -76,16 +74,7 @@ export async function evaluateGatewayShellAllowlist(
   allowlist: ExecAllowlistEntry[],
   autoAllowSkills: boolean,
 ) {
-  const skillBins = autoAllowSkills
-    ? (
-        await resolveGatewaySkillBins({
-          config: params.config,
-          agentId: params.agentId,
-          skillScope: params.skillScope,
-          env: params.env,
-        })
-      ).skillBins
-    : [];
+  const skillBins = autoAllowSkills ? (await resolveGatewaySkillBins(params)).skillBins : [];
   return evaluateShellAllowlistWithAuthorization({
     command: params.command,
     allowlist,
@@ -144,12 +133,7 @@ export async function verifyGatewaySkillBinAuthority(
   if (!params.autoAllowSkills) {
     return { revoked: firstSkillSegment };
   }
-  const { skillBins, pathEnv, source } = await resolveGatewaySkillBins({
-    config: params.allowlistParams.config,
-    agentId: params.allowlistParams.agentId,
-    skillScope: params.allowlistParams.skillScope,
-    env: params.allowlistParams.env,
-  });
+  const { skillBins, pathEnv, source } = await resolveGatewaySkillBins(params.allowlistParams);
   const revoked = skillSegments.find(
     (segment) => !isSegmentAuthorizedBySkillBins({ segment, skillBins }),
   );

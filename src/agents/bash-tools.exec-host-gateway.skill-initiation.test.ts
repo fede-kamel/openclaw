@@ -83,8 +83,10 @@ describe.skipIf(process.platform === "win32")(
     });
 
     // Mirrors the exec tool: gateway authorization, then the runtime launch with its hooks, with a
-    // final-preflight denial unwrapped into the tool result.
-    async function launchSkillCommand() {
+    // final-preflight denial unwrapped into the tool result. `borrowedPolicy` runs as agent
+    // `execution` (which owns the skill) under the tool policy of agent `main`, whose workspace has
+    // no skills, as tool assembly does when a run borrows another agent's policy.
+    async function launchSkillCommand(borrowedPolicy = false) {
       const command = `skill-tool ${marker}`;
       const env = { PATH: `${binDir}:/usr/bin:/bin` };
       const approval = await processGatewayAllowlist({
@@ -102,9 +104,17 @@ describe.skipIf(process.platform === "win32")(
         maxOutput: 1000,
         pendingMaxOutput: 1000,
         agentId: "main",
+        ...(borrowedPolicy ? { skillScope: { ownerAgentId: "execution" } } : {}),
         config: {
           plugins: { enabled: false },
-          agents: { entries: { main: { workspace } } },
+          agents: {
+            entries: borrowedPolicy
+              ? {
+                  main: { workspace: path.join(root, "policy-workspace") },
+                  execution: { workspace },
+                }
+              : { main: { workspace } },
+          },
         } satisfies OpenClawConfig,
       });
       expect(approval.deniedResult).toBeUndefined();
@@ -133,27 +143,34 @@ describe.skipIf(process.platform === "win32")(
       }
     }
 
-    it("launches the skill bin while skill trust holds through initiation", async () => {
-      const result = await launchSkillCommand();
-      expect(result.outcome).toMatchObject({ status: "completed", exitCode: 0 });
-      expect(registerEgress).toHaveBeenCalledOnce();
-      expect(fs.existsSync(marker)).toBe(true);
-    });
+    it.each([false, true])(
+      "launches the skill bin while skill trust holds through initiation (borrowed policy: %s)",
+      async (borrowedPolicy) => {
+        const result = await launchSkillCommand(borrowedPolicy);
+        expect(result.outcome).toMatchObject({ status: "completed", exitCode: 0 });
+        expect(registerEgress).toHaveBeenCalledOnce();
+        expect(fs.existsSync(marker)).toBe(true);
+      },
+    );
+
+    const uninstallSkill = () => {
+      const skillDir = path.join(workspace, "skills", "skill-tool");
+      fs.rmSync(skillDir, { recursive: true });
+      bumpSkillsSnapshotVersion({
+        workspaceDir: workspace,
+        reason: "watch",
+        changedPath: skillDir,
+      });
+    };
 
     // The spawn preflight has already re-resolved skill trust when these withdrawals land, so only a
     // synchronous recheck at native initiation can stop the launch.
     it.each([
+      { name: "the authorizing skill is uninstalled", withdraw: uninstallSkill },
       {
-        name: "the authorizing skill is uninstalled",
-        withdraw: () => {
-          const skillDir = path.join(workspace, "skills", "skill-tool");
-          fs.rmSync(skillDir, { recursive: true });
-          bumpSkillsSnapshotVersion({
-            workspaceDir: workspace,
-            reason: "watch",
-            changedPath: skillDir,
-          });
-        },
+        name: "the executing agent's skill is uninstalled under a borrowed policy",
+        withdraw: uninstallSkill,
+        borrowedPolicy: true,
       },
       {
         name: "the trusted bin name is repointed",
@@ -164,9 +181,9 @@ describe.skipIf(process.platform === "win32")(
           fs.symlinkSync(swapped, path.join(binDir, "skill-tool"));
         },
       },
-    ])("denies at native initiation when $name after preflight", async ({ withdraw }) => {
-      launchWait.during = withdraw;
-      const result = await launchSkillCommand();
+    ])("denies at native initiation when $name after preflight", async (withdrawal) => {
+      launchWait.during = withdrawal.withdraw;
+      const result = await launchSkillCommand("borrowedPolicy" in withdrawal);
       // Preflight passed: the launch reached the post-preflight wait where trust was withdrawn.
       expect(registerEgress).toHaveBeenCalledOnce();
       expect(result.outcome).toBeUndefined();

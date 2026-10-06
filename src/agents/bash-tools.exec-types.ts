@@ -68,6 +68,11 @@ export type ExecProcessOutcome =
  * borrow the binaries it declares.
  */
 export type ExecSkillScope = {
+  /**
+   * Executing agent whose skills may authorize bins. Approval policy stays with the exec `agentId`,
+   * which names another agent when the run borrows that agent's tool policy.
+   */
+  ownerAgentId?: string;
   /** Normalized agent-level filter used to build the run's snapshot; undefined means unrestricted. */
   skillFilter?: string[];
   /** Sparse per-session overlay applied after the agent-level filter. */
