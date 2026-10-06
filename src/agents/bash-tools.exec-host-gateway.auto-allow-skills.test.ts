@@ -17,9 +17,11 @@ import { callGatewayTool } from "./tools/gateway.js";
 
 const spawn = vi.hoisted(() => vi.fn<ProcessSupervisor["spawn"]>());
 const sendFollowup = vi.hoisted(() => vi.fn(async (_target: unknown, _text: string) => {}));
+// mock-isolation: no child process is started; the spawn spy records whether launch was reached.
 vi.mock("../process/supervisor/index.js", () => ({
   getProcessSupervisor: () => ({ spawn }),
 }));
+// mock-isolation: approval RPCs use a synthetic Gateway peer; no live Gateway is contacted.
 vi.mock("./tools/gateway.js", () => ({
   callGatewayTool: vi.fn(),
   readGatewayCallOptions: vi.fn(() => ({})),
