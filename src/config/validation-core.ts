@@ -76,7 +76,10 @@ export function collectHeartbeatOwnerWarnings(config: OpenClawConfig): ConfigVal
  * attachment arrives.
  */
 export function collectMediaCliEntryWarnings(config: OpenClawConfig): ConfigValidationIssue[] {
-  return collectMediaCliModelIssues(config).map(({ path, message }) => ({ path, message }));
+  return collectMediaCliModelIssues(config).map((issue) => ({
+    path: issue.path,
+    message: issue.message,
+  }));
 }
 
 function materializeBundledModelProviderOverlays(config: OpenClawConfig): OpenClawConfig {

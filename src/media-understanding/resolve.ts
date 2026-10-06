@@ -24,6 +24,9 @@ import { resolveEffectiveMediaEntryCapabilities } from "./entry-capabilities.js"
 import { resolveMediaUnderstandingScope } from "./scope.js";
 import type { MediaUnderstandingCapability } from "./types.js";
 
+// The CLI input check lives in a dependency-light module so config validation can share it.
+export { resolveCliModelEntry } from "./cli-model-entry.js";
+
 export type ResolvedMediaModelEntry = {
   entry: MediaUnderstandingModelConfig;
   secretOwnerId?: string;
