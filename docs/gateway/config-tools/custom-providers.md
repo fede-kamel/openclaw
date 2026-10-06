@@ -131,6 +131,8 @@ Configuring a custom/local provider `baseUrl` is also the narrow network trust d
     | `toolCallArgumentsEncoding` | Selects the endpoint's tool-call argument encoding. |
     | `requiresOpenAiAnthropicToolPayload` | Converts OpenAI-shaped tool calls to Anthropic-family payloads. |
 
+    Custom `openai-completions` endpoints default to `supportsUsageInStreaming: false`, so OpenClaw does not request `stream_options.include_usage`. If the endpoint then returns no usage, token counts and cost stay empty, context size falls back to estimates (which can trigger compaction early), and the Gateway logs `<provider>/<model> returned no token usage` once per model. Most OpenAI-compatible servers (vLLM, LiteLLM, llama.cpp) accept the option; set `compat.supportsUsageInStreaming: true` on each model entry once verified.
+
   </Accordion>
   <Accordion title="Amazon Bedrock discovery">
     - `plugins.entries.amazon-bedrock.config.discovery`: Bedrock auto-discovery settings root.

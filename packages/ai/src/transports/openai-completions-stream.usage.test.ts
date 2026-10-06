@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { configureAiTransportHost, getAiTransportHost } from "../host.js";
 import { processCompletionsStream } from "./openai-completions-stream.js";
 import {
   type CapturedStreamEvent,
@@ -116,6 +117,63 @@ async function runChunks(chunks: readonly unknown[], model = makeCompletionsMode
 }
 
 describe("openai completions stream", () => {
+  describe("missing streaming usage hint", () => {
+    const initialHost = getAiTransportHost();
+    afterEach(() => configureAiTransportHost(initialHost));
+    const customModel = (id: string, compat?: { supportsUsageInStreaming: boolean }) =>
+      makeCompletionsModel({
+        id,
+        provider: "spark-router",
+        baseUrl: "https://llm.example.com/v1",
+        reasoning: false,
+        ...(compat ? { compat } : {}),
+      });
+    const reply = makeCompletionsChunk({ role: "assistant", content: "ok" }, "stop");
+
+    it.each([
+      {
+        name: "custom route without usage",
+        model: customModel("qwen-a"),
+        chunks: [reply],
+        warns: 1,
+      },
+      {
+        name: "custom route with usage opt-in",
+        model: customModel("qwen-b", { supportsUsageInStreaming: true }),
+        chunks: [reply],
+        warns: 0,
+      },
+      {
+        name: "custom route that reports usage",
+        model: customModel("qwen-c"),
+        chunks: [reply, usageChunk(2)],
+        warns: 0,
+      },
+      {
+        name: "catalog-known route",
+        model: makeCompletionsModel({ provider: "chutes", baseUrl: "https://llm.chutes.ai/v1" }),
+        chunks: [reply],
+        warns: 0,
+      },
+    ])("warns once for $name", async ({ model, chunks, warns }) => {
+      const logWarn = vi.fn();
+      configureAiTransportHost({ ...initialHost, logWarn });
+      await runChunks(chunks, model);
+      await runChunks(chunks, model);
+      expect(logWarn).toHaveBeenCalledTimes(warns);
+      if (warns) {
+        expect(logWarn).toHaveBeenCalledWith(
+          "openai-transport",
+          "spark-router/qwen-a returned no token usage, so context size and cost are estimated. " +
+            "If this OpenAI-compatible endpoint supports stream_options.include_usage " +
+            "(vLLM, LiteLLM, llama.cpp and most do), set compat.supportsUsageInStreaming: true " +
+            "on the model in models.providers.spark-router.models.",
+          { provider: "spark-router", model: "qwen-a" },
+        );
+      }
+    });
+  });
+
   it.each(usageCases)("parses $name", ({ usage, expected, model = pricedModel }) => {
     expectRecordFields(parseOpenAICompletionsUsage(usage, model), expected);
   });

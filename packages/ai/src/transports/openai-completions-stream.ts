@@ -34,6 +34,7 @@ import { notifyLlmRequestActivity } from "../utils/llm-request-activity.js";
 import { createReasoningTagTextPartitioner } from "../utils/reasoning-tag-text-partitioner.js";
 import { withFirstStreamEventTimeout } from "../utils/stream-first-event-timeout.js";
 import { createDeepSeekTextFilter } from "./deepseek-text-filter.js";
+import { detectOpenAICompletionsCompat } from "./openai-completions-compat.js";
 import {
   createDsmlRecoverer,
   type DeepSeekDsmlRecoveredPart,
@@ -42,6 +43,7 @@ import {
 import { getCompat } from "./openai-transport-params.js";
 import {
   isOpenAICompletionsThinkingEnabled,
+  log,
   parseOpenAICompletionsUsage,
   readOpenAICompletionsContentDeltas,
   readOpenAICompletionsReasoningBatch,
@@ -107,7 +109,8 @@ export async function processCompletionsStream(
   const MAX_POST_TOOL_CALL_BUFFER_BYTES = 256_000;
   const directMode = options?.mode === "direct";
   const emitReasoning = options?.emitReasoning ?? true;
-  const compat = getCompat(model as OpenAIModeModel);
+  const openAIModel = model as OpenAIModeModel;
+  const compat = getCompat(openAIModel);
   const visibleReasoningDetailTypes = new Set(compat.visibleReasoningDetailTypes);
   const shouldFilterDeepSeekDsmlText = !directMode && compat.thinkingFormat === "deepseek";
   const deepSeekTextFilter = shouldFilterDeepSeekDsmlText ? createDeepSeekTextFilter() : null;
@@ -136,6 +139,7 @@ export async function processCompletionsStream(
   let explicitVisibleTextBlocks: Set<TextBlock> | undefined;
   const normalizeToolCallDeltas = createOpenAICompletionsToolCallDeltaNormalizer();
   let finishReason: string | undefined;
+  let sawUsage = false;
   let sawNativeToolCallDelta = false;
   const blockIndex = () =>
     directMode && currentBlock && currentBlock.type !== "toolCall"
@@ -418,6 +422,7 @@ export async function processCompletionsStream(
       usage && hasOpenAICompletionsReasoningUsageActivity(usage),
     );
     if (usage) {
+      sawUsage = true;
       output.usage = parseOpenAICompletionsUsage(usage, model, {
         includeReasoningTokens: !directMode,
       });
@@ -643,6 +648,43 @@ export async function processCompletionsStream(
   if (output.stopReason === "toolUse") {
     tagPendingCommentaryText(output.content);
   }
+  if (
+    !sawUsage &&
+    !compat.supportsUsageInStreaming &&
+    output.stopReason !== "error" &&
+    output.stopReason !== "aborted"
+  ) {
+    warnMissingStreamingUsage(openAIModel);
+  }
+}
+
+// One hint per provider/model per process, capped so a long-lived Gateway that
+// cycles through many custom models cannot grow the memo without bound.
+const MAX_MISSING_USAGE_HINT_KEYS = 256;
+const missingUsageHintKeys = new Set<string>();
+
+/**
+ * A custom OpenAI-compatible endpoint only streams usage when the request opts
+ * in, so without the compat flag every turn records zero usage and context
+ * pressure falls back to character estimates. Catalog-known routes own their
+ * compat, so only custom endpoints get the config hint.
+ */
+function warnMissingStreamingUsage(model: OpenAIModeModel) {
+  const key = `${model.provider}/${model.id}`;
+  if (missingUsageHintKeys.has(key) || missingUsageHintKeys.size >= MAX_MISSING_USAGE_HINT_KEYS) {
+    return;
+  }
+  missingUsageHintKeys.add(key);
+  if (detectOpenAICompletionsCompat(model).capabilities.endpointClass !== "custom") {
+    return;
+  }
+  log.warn(
+    `${key} returned no token usage, so context size and cost are estimated. ` +
+      "If this OpenAI-compatible endpoint supports stream_options.include_usage " +
+      "(vLLM, LiteLLM, llama.cpp and most do), set compat.supportsUsageInStreaming: true " +
+      `on the model in models.providers.${model.provider}.models.`,
+    { provider: model.provider, model: model.id },
+  );
 }
 
 export function shouldEmitOpenAICompletionsReasoning(
