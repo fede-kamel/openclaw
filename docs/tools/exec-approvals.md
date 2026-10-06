@@ -643,8 +643,9 @@ if you want strict manual allowlists.
 Eligibility here is the session's, not just the agent's: a skill excluded by the
 session's skill filter or turned off for the session does not lend its binaries
 to that run, even while another session of the same agent still uses them. The
-resolved executable is also rechecked immediately before launch, so a trusted
-name repointed at a different binary after approval is denied instead of run.
+resolved executable is also rechecked immediately before launch, on every Gateway
+launch path, so a trusted name repointed at a different binary, or a skill that
+stopped being eligible, while approval was pending is denied instead of run.
 
 Skill trust belongs to the Gateway that supplied it. Switching Gateways retires
 the previous cache, including the Mac app's trusted-binary list and an approval

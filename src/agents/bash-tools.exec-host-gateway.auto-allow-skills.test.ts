@@ -3,8 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { saveExecApprovals } from "../infra/exec-approvals.js";
+import { saveExecApprovals } from "../infra/exec-approvals-store.test-support.js";
 import type { ProcessSupervisor } from "../process/supervisor/types.js";
+import { bumpSkillsSnapshotVersion } from "../skills/runtime/refresh-state.js";
 import { writeSkill } from "../skills/test-support/e2e-test-helpers.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
@@ -15,12 +16,19 @@ import type { ExecSkillScope } from "./bash-tools.exec-types.js";
 import { callGatewayTool } from "./tools/gateway.js";
 
 const spawn = vi.hoisted(() => vi.fn<ProcessSupervisor["spawn"]>());
+const sendFollowup = vi.hoisted(() => vi.fn(async (_target: unknown, _text: string) => {}));
 vi.mock("../process/supervisor/index.js", () => ({
   getProcessSupervisor: () => ({ spawn }),
 }));
 vi.mock("./tools/gateway.js", () => ({
   callGatewayTool: vi.fn(),
   readGatewayCallOptions: vi.fn(() => ({})),
+}));
+// Follow-up delivery is the only seam on the detached path; approval, launch and the spawn
+// boundary run for real.
+vi.mock("./bash-tools.exec-host-shared.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./bash-tools.exec-host-shared.js")>()),
+  sendExecApprovalFollowupResult: sendFollowup,
 }));
 
 describe.skipIf(process.platform === "win32")("gateway-host exec autoAllowSkills", () => {
@@ -65,6 +73,7 @@ describe.skipIf(process.platform === "win32")("gateway-host exec autoAllowSkills
     });
     resetProcessRegistryForTests();
     vi.mocked(callGatewayTool).mockReset();
+    sendFollowup.mockClear();
     spawn.mockReset().mockImplementation(async () => ({
       activity: { resultSettled: true, lastOutputAtMs: Date.now() },
       runId: "skill-bins-spawn",
@@ -131,6 +140,36 @@ describe.skipIf(process.platform === "win32")("gateway-host exec autoAllowSkills
     );
   }
 
+  function runGatewayAllowlist(ask: "off" | "always", extra?: { approvalFollowupMode: "agent" }) {
+    return processGatewayAllowlist({
+      command: "skill-tool",
+      workdir: root,
+      env: { PATH: `${binDir}:/usr/bin:/bin` },
+      pty: false,
+      defaultTimeoutSec: 30,
+      security: "allowlist",
+      ask,
+      safeBins: new Set(),
+      safeBinProfiles: {},
+      warnings: [],
+      approvalRunningNoticeMs: 0,
+      maxOutput: 1000,
+      pendingMaxOutput: 1000,
+      agentId: "main",
+      config: buildConfig(),
+      ...extra,
+    });
+  }
+
+  // Repoint the trusted name at a different executable, as a skill upgrade or a planted
+  // replacement would between authorization and spawn.
+  function swapSkillBin() {
+    const swapped = path.join(root, "swapped-tool");
+    fs.copyFileSync("/usr/bin/true", swapped);
+    fs.rmSync(path.join(binDir, "skill-tool"));
+    fs.symlinkSync(swapped, path.join(binDir, "skill-tool"));
+  }
+
   it("runs a workspace skill's declared bin when autoAllowSkills is on", async () => {
     const result = await run(true, "skill-tool");
     expect(result.details).toMatchObject({ status: "completed", exitCode: 0 });
@@ -180,39 +219,68 @@ describe.skipIf(process.platform === "win32")("gateway-host exec autoAllowSkills
   // settles. The spawn boundary must, before the process can do any I/O.
   it("denies at the spawn boundary when the authorizing skill bin is swapped", async () => {
     saveApprovals(true);
-    const result = await processGatewayAllowlist({
-      command: "skill-tool",
-      workdir: root,
-      env: { PATH: `${binDir}:/usr/bin:/bin` },
-      pty: false,
-      defaultTimeoutSec: 30,
-      security: "allowlist",
-      ask: "off",
-      safeBins: new Set(),
-      safeBinProfiles: {},
-      warnings: [],
-      approvalRunningNoticeMs: 0,
-      maxOutput: 1000,
-      pendingMaxOutput: 1000,
-      agentId: "main",
-      config: buildConfig(),
-    });
+    const result = await runGatewayAllowlist("off");
     expect(result.deniedResult).toBeUndefined();
     expect(result.revalidateBeforeExecution).toBeTypeOf("function");
 
-    // Repoint the trusted name at a different executable, as a skill upgrade or a planted
-    // replacement would between authorization and spawn.
-    const swapped = path.join(root, "swapped-tool");
-    fs.copyFileSync("/usr/bin/true", swapped);
-    fs.rmSync(path.join(binDir, "skill-tool"));
-    fs.symlinkSync(swapped, path.join(binDir, "skill-tool"));
+    swapSkillBin();
 
     const denied = await result.revalidateBeforeExecution?.();
-    expect(denied?.details).toMatchObject({ status: "failed", exitCode: null });
-    expect(denied?.details?.aggregated).toContain(
-      "SYSTEM_RUN_DENIED: skill bin authorization changed before execution",
-    );
+    expect(denied?.details).toMatchObject({
+      status: "failed",
+      exitCode: null,
+      aggregated: expect.stringContaining(
+        "SYSTEM_RUN_DENIED: skill bin authorization changed before execution",
+      ),
+    });
     expect(spawn).not.toHaveBeenCalled();
+  });
+
+  // A detached approval settles long after evaluation and launches from its own callback. With
+  // ask "always", a skill-authorized command must still launch while trust holds, and must not
+  // reach spawn once the authorizing skill is removed while the approval is pending: the
+  // executable is unchanged, so only the skill-authority recheck can catch it.
+  it.each([
+    { name: "launches when skill trust still holds", withdraw: false },
+    { name: "denies before spawn when skill trust is withdrawn", withdraw: true },
+  ])("detached approval launch $name", async ({ withdraw }) => {
+    saveExecApprovals({
+      version: 1,
+      defaults: { security: "allowlist", ask: "always", askFallback: "deny" },
+      agents: { main: { autoAllowSkills: true, allowlist: [] } },
+    });
+    vi.mocked(callGatewayTool).mockImplementation(async (method: string) => {
+      if (method === "exec.approval.request") {
+        return { status: "accepted" };
+      }
+      if (method === "exec.approval.waitDecision") {
+        if (withdraw) {
+          // Uninstall the authorizing skill, as the skills watcher would observe it.
+          const skillDir = path.join(workspace, "skills", "skill-tool");
+          fs.rmSync(skillDir, { recursive: true });
+          bumpSkillsSnapshotVersion({
+            workspaceDir: workspace,
+            reason: "watch",
+            changedPath: skillDir,
+          });
+        }
+        return { decision: "allow-once" };
+      }
+      throw new Error(`Unexpected Gateway method: ${method}`);
+    });
+
+    const result = await runGatewayAllowlist("always", { approvalFollowupMode: "agent" });
+
+    expect(result.pendingResult?.details.status).toBe("approval-pending");
+    await vi.waitFor(() => expect(sendFollowup).toHaveBeenCalled(), { timeout: 10_000 });
+    const followup = String(sendFollowup.mock.calls.at(-1)?.[1]);
+    if (withdraw) {
+      expect(followup).toContain("skill bin authorization changed before execution");
+      expect(spawn).not.toHaveBeenCalled();
+    } else {
+      expect(followup).toContain("Exec finished");
+      expect(spawn).toHaveBeenCalledOnce();
+    }
   });
 
   // Skill bins resolve on the command's PATH, which is safe only because host exec refuses a
