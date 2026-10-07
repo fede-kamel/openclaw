@@ -270,7 +270,7 @@ function* assembleOpenClawCodingTools(
             // executing agent's skills, never a borrowed policy agent's, narrowed so a session
             // filter or override that excludes a skill also withdraws its binaries.
             skillScope: {
-              ownerAgentId: executionAgentId,
+              ownerAgentId: options?.skillOwnerAgentId ?? executionAgentId,
               ...(options?.skillsSnapshot?.skillFilter
                 ? { skillFilter: options.skillsSnapshot.skillFilter }
                 : {}),
