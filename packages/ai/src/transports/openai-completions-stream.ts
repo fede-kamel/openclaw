@@ -7,6 +7,7 @@ import type {
   ToolCall,
 } from "@openclaw/llm-core";
 import { appendAssistantThinking } from "@openclaw/llm-core/event-stream";
+import { asPositiveFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { readNonEmptyStringPreservingWhitespace } from "@openclaw/normalization-core/string-coerce";
 import type { ChatCompletionChunk } from "openai/resources/chat/completions.js";
 import type { OpenAICompletionsOptions } from "../provider-options.js";
@@ -169,7 +170,8 @@ export async function processCompletionsStream(
     }
     previous.text += next.text;
   };
-  const appendThinkingDeltaInternal = (reasoningDelta: { signature?: string; text: string }) => {
+  const appendThinkingDelta = (reasoningDelta: { signature?: string; text: string }) => {
+    flushPendingPostToolCallDeltas();
     if (directMode && directThinkingBlock) {
       currentBlock = directThinkingBlock;
     }
@@ -197,7 +199,8 @@ export async function processCompletionsStream(
       partial: output,
     });
   };
-  const appendTextDeltaInternal = (text: string, source?: OpenAICompletionsTextSource) => {
+  const appendTextDelta = (text: string, source?: OpenAICompletionsTextSource) => {
+    flushPendingPostToolCallDeltas();
     if (directMode && directTextBlock) {
       currentBlock = directTextBlock;
     }
@@ -236,23 +239,16 @@ export async function processCompletionsStream(
       return;
     }
     const bufferedDeltas = pendingPostToolCallDeltas;
+    // Detach the buffer so each append below sees an empty queue.
     pendingPostToolCallDeltas = [];
     pendingPostToolCallBytes = 0;
     for (const delta of bufferedDeltas) {
       if (delta.kind === "text") {
-        appendTextDeltaInternal(delta.text, delta.source);
+        appendTextDelta(delta.text, delta.source);
       } else if (emitReasoning) {
-        appendThinkingDeltaInternal(delta);
+        appendThinkingDelta(delta);
       }
     }
-  };
-  const appendThinkingDelta = (reasoningDelta: { signature?: string; text: string }) => {
-    flushPendingPostToolCallDeltas();
-    appendThinkingDeltaInternal(reasoningDelta);
-  };
-  const appendTextDelta = (text: string, source?: OpenAICompletionsTextSource) => {
-    flushPendingPostToolCallDeltas();
-    appendTextDeltaInternal(text, source);
   };
   const appendVisibleTextDelta = (text: string) => {
     if (!text) {
@@ -285,8 +281,7 @@ export async function processCompletionsStream(
     }
   };
   const appendRecoveredToolCall = (toolCall: RecoveredDeepSeekDsmlToolCall) => {
-    const switchingToolCall = currentBlock?.type === "toolCall";
-    if (switchingToolCall) {
+    if (currentBlock?.type === "toolCall") {
       currentBlock = null;
       flushPendingPostToolCallDeltas();
     }
@@ -418,7 +413,7 @@ export async function processCompletionsStream(
     const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
     const usage = chunk.usage || choice?.usage;
     const hasReasoningUsageActivity = Boolean(
-      usage && hasOpenAICompletionsReasoningUsageActivity(usage),
+      asPositiveFiniteNumber(usage?.completion_tokens_details?.reasoning_tokens),
     );
     if (usage) {
       output.usage = parseOpenAICompletionsUsage(usage, model, {
@@ -514,8 +509,7 @@ export async function processCompletionsStream(
             block = toolCallBlocksById.get(toolCall.id);
           }
           if (!block) {
-            const switchingToolCall = currentBlock?.type === "toolCall";
-            if (switchingToolCall) {
+            if (currentBlock?.type === "toolCall") {
               currentBlock = null;
               flushPendingPostToolCallDeltas();
             }
@@ -675,8 +669,7 @@ function warnMissingStreamingUsage(model: OpenAIModeModel) {
   missingUsageHintKeys.add(key);
   log.warn(
     `${key} returned no token usage; context size is estimated and token accounting is unavailable. ` +
-      "If this OpenAI-compatible endpoint supports stream_options.include_usage " +
-      "(vLLM, LiteLLM, llama.cpp and most do), set compat.supportsUsageInStreaming: true " +
+      "If this endpoint supports stream_options.include_usage, set compat.supportsUsageInStreaming: true " +
       `on the model in models.providers.${model.provider}.models.`,
     { provider: model.provider, model: model.id },
   );
@@ -691,13 +684,4 @@ export function shouldEmitOpenAICompletionsReasoning(
   }
   const effort = options?.reasoningEffort ?? options?.reasoning ?? "high";
   return Boolean(effort) && isOpenAICompletionsThinkingEnabled(effort);
-}
-
-function hasOpenAICompletionsReasoningUsageActivity(
-  rawUsage: NonNullable<ChatCompletionChunk["usage"]>,
-) {
-  const reasoningTokens = rawUsage.completion_tokens_details?.reasoning_tokens;
-  return (
-    typeof reasoningTokens === "number" && Number.isFinite(reasoningTokens) && reasoningTokens > 0
-  );
 }
