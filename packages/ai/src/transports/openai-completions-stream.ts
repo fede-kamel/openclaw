@@ -139,7 +139,6 @@ export async function processCompletionsStream(
   let explicitVisibleTextBlocks: Set<TextBlock> | undefined;
   const normalizeToolCallDeltas = createOpenAICompletionsToolCallDeltaNormalizer();
   let finishReason: string | undefined;
-  let sawUsage = false;
   let sawNativeToolCallDelta = false;
   const blockIndex = () =>
     directMode && currentBlock && currentBlock.type !== "toolCall"
@@ -422,7 +421,6 @@ export async function processCompletionsStream(
       usage && hasOpenAICompletionsReasoningUsageActivity(usage),
     );
     if (usage) {
-      sawUsage = true;
       output.usage = parseOpenAICompletionsUsage(usage, model, {
         includeReasoningTokens: !directMode,
       });
@@ -649,12 +647,15 @@ export async function processCompletionsStream(
     tagPendingCommentaryText(output.content);
   }
   if (
-    !sawUsage &&
-    !compat.supportsUsageInStreaming &&
+    !output.usage.contextUsage &&
+    !options?.signal?.aborted &&
     output.stopReason !== "error" &&
     output.stopReason !== "aborted"
   ) {
-    warnMissingStreamingUsage(openAIModel);
+    output.usage.contextUsage = { state: "unavailable" };
+    if (!compat.supportsUsageInStreaming) {
+      warnMissingStreamingUsage(openAIModel);
+    }
   }
 }
 
@@ -663,23 +664,17 @@ export async function processCompletionsStream(
 const MAX_MISSING_USAGE_HINT_KEYS = 256;
 const missingUsageHintKeys = new Set<string>();
 
-/**
- * A custom OpenAI-compatible endpoint only streams usage when the request opts
- * in, so without the compat flag every turn records zero usage and context
- * pressure falls back to character estimates. Catalog-known routes own their
- * compat, so only custom endpoints get the config hint.
- */
 function warnMissingStreamingUsage(model: OpenAIModeModel) {
+  if (detectOpenAICompletionsCompat(model).capabilities.endpointClass !== "custom") {
+    return;
+  }
   const key = `${model.provider}/${model.id}`;
   if (missingUsageHintKeys.has(key) || missingUsageHintKeys.size >= MAX_MISSING_USAGE_HINT_KEYS) {
     return;
   }
   missingUsageHintKeys.add(key);
-  if (detectOpenAICompletionsCompat(model).capabilities.endpointClass !== "custom") {
-    return;
-  }
   log.warn(
-    `${key} returned no token usage, so context size and cost are estimated. ` +
+    `${key} returned no token usage; context size is estimated and token accounting is unavailable. ` +
       "If this OpenAI-compatible endpoint supports stream_options.include_usage " +
       "(vLLM, LiteLLM, llama.cpp and most do), set compat.supportsUsageInStreaming: true " +
       `on the model in models.providers.${model.provider}.models.`,

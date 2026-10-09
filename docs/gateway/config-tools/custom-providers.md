@@ -131,7 +131,9 @@ Configuring a custom/local provider `baseUrl` is also the narrow network trust d
     | `toolCallArgumentsEncoding` | Selects the endpoint's tool-call argument encoding. |
     | `requiresOpenAiAnthropicToolPayload` | Converts OpenAI-shaped tool calls to Anthropic-family payloads. |
 
-    Custom `openai-completions` endpoints default to `supportsUsageInStreaming: false`, so OpenClaw does not request `stream_options.include_usage`. If the endpoint then returns no usage, token counts and cost stay empty, context size falls back to estimates (which can trigger compaction early), and the Gateway logs `<provider>/<model> returned no token usage` once per model. Most OpenAI-compatible servers (vLLM, LiteLLM, llama.cpp) accept the option; set `compat.supportsUsageInStreaming: true` on each model entry once verified.
+    Unknown remote `openai-completions` endpoints default to `supportsUsageInStreaming: false`, so OpenClaw does not request `stream_options.include_usage`. Loopback endpoints and the bundled llama.cpp, LM Studio, Ollama, and vLLM providers already request or collect usage. For a custom remote server that supports this option, set `compat.supportsUsageInStreaming: true` on each model entry. Ollama `/v1` and LM Studio return streamed usage when this option is enabled.
+
+    When a successful stream returns no usage, OpenClaw marks provider context usage unavailable so compaction uses content estimates instead of treating missing counts as zero. Estimates are approximate; token and cost accounting cannot be recovered from a missing usage record. Custom remote endpoints with streaming usage disabled also log `<provider>/<model> returned no token usage` once per model, with the config hint above.
 
   </Accordion>
   <Accordion title="Amazon Bedrock discovery">
